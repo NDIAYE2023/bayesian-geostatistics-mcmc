@@ -1,0 +1,2251 @@
+---
+title: "Application de MALA au modèle géostatistique Tobit"
+author: "Documentation du stage"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+## Objectif
+
+Ce document présente l'application des méthodes MALA développées pendant
+le stage à un modèle géostatistique Tobit.
+
+Le modèle Tobit est utilisé lorsque la variable d'intérêt est continue
+mais qu'une partie des observations est censurée. On suppose qu'il
+existe une variable continue sous-jacente qui n'est observée exactement
+que lorsqu'elle dépasse un certain seuil.
+
+L'objectif est d'estimer le champ spatial latent (w) à partir des
+observations censurées et d'étudier l'efficacité de différentes
+stratégies de préconditionnement de MALA.
+
+La démarche suivie est :
+
+1.  construire le champ spatial avec l'approximation de Vecchia ;
+2.  simuler la variable continue latente ;
+3.  appliquer la censure Tobit ;
+4.  construire la log-postérieure ;
+5.  calculer son gradient ;
+6.  caractériser sa Hessienne ;
+7.  calculer le MAP ;
+8.  construire les préconditionnements ;
+9.  exécuter MALA avec persistance du momentum ;
+10. estimer la moyenne et la variance postérieures ;
+11. calculer les ESS et les diagnostics MCMC ;
+12. reconstruire le champ latent ;
+13. préparer l'expérience factorielle.
+
+Dans toute cette étude, les paramètres du modèle sont considérés comme
+connus. L'inférence porte uniquement sur le champ latent (w).
+
+## 1. Chargement des packages
+
+### Rôle du code
+
+Ce premier bloc charge les bibliothèques nécessaires.
+
+`Matrix` permet de travailler avec les grandes matrices creuses
+intervenant dans l'approximation de Vecchia et les préconditionnements.
+
+`GpGp` est utilisé pour construire l'approximation de Vecchia du
+processus gaussien.
+
+`coda` permet notamment de calculer la taille effective d'échantillon
+(ESS) des chaînes MCMC.
+
+`ggplot2` sera utilisé pour les analyses graphiques finales.
+
+```{r}
+library(Matrix)
+library(GpGp)
+library(coda)
+library(ggplot2)
+```
+
+## 2. Paramètres généraux
+
+### Rôle du code
+
+Ce bloc définit les paramètres généraux utilisés pour une première
+validation du modèle Tobit.
+
+Je commence volontairement avec une configuration unique avant de lancer
+un plan factoriel complet.
+
+Les paramètres sont :
+
+- `dimension` : dimension du domaine spatial ;
+- `n` : nombre de sites ;
+- `nb_nn` : nombre de voisins de Vecchia ;
+- `n_iter` : nombre total d'itérations MCMC ;
+- `burn_in` : nombre d'itérations utilisées pour l'adaptation ;
+- `sigma2` : variance marginale du champ spatial ;
+- `nu` : paramètre de régularité de Matérn ;
+- `range` : paramètre utilisé dans la construction de la covariance ;
+- `tau2` : variance du bruit gaussien du modèle Tobit ;
+- `beta` : coefficients des effets fixes ;
+- `rho` : persistance du momentum.
+
+Pour la première validation, je choisi une taille plus petite que
+(n=10,000). Une fois toutes les vérifications effectuées, cette valeur
+pourra être augmentée.
+
+```{r}
+set.seed(1)
+
+dimension = 2
+n = 1000
+nb_nn = 30
+
+n_iter = 10000
+burn_in = 2000
+
+sigma2 = 1
+nu = 1.5
+range = 0.2
+tau2 = 1
+
+beta = c(0, 0.01)
+
+rho = 0.5
+```
+
+## 3. Génération des positions spatiales
+
+### Rôle mathématique
+
+Le champ latent est observé sur des positions
+
+$$ s_1,\ldots,s_n \in [0,1]^d. $$
+
+La fonction suivante génère ces positions aléatoirement.
+
+Pour `dimension = 2`, la sortie est donc une matrice de taille
+$(n\times2)$.
+
+### Entrées
+
+- `dimension` : dimension spatiale ;
+- `n` : nombre de sites.
+
+### Sortie
+
+Une matrice contenant les coordonnées spatiales.
+
+```{r}
+createLocs = function(dimension, n) {
+  matrix( runif(n * dimension), nrow = n, ncol = dimension )
+}
+
+locs = createLocs(dimension, n)
+
+dim(locs)
+head(locs)
+```
+
+## 4. Construction de la matrice de régression
+
+### Rôle du code
+
+Le prédicteur linéaire du modèle Tobit est
+
+$$ X\beta+w. $$
+
+Comme dans les applications précédentes, la matrice (X) contient un
+intercept et une covariable gaussienne.
+
+J'utilise
+
+\$\$ \beta =
+
+\begin{pmatrix}
+\beta_0\\
+0.01
+\end{pmatrix}
+
+. \$\$
+
+```{r}
+X = cbind( 1, rnorm(n))
+xb = as.vector(X %*% beta)
+
+dim(X)
+head(xb)
+```
+
+## 5. Approximation de Vecchia
+
+### Rôle mathématique
+
+Le champ latent satisfait
+
+$$ w\sim\mathcal N(0,Q_0^{-1}). $$
+
+Pour éviter de manipuler directement une matrice de covariance dense de
+taille $(n\times n)$, j'utilise l'approximation de Vecchia.
+
+Elle fournit une matrice triangulaire creuse $(\widetilde R)$ telle que
+
+$$ Q_0 = \widetilde R^\top\widetilde R. $$
+
+Cette représentation est essentielle lorsque (n) devient grand.
+
+### Étapes du code
+
+Le code :
+
+1.  détermine les voisins utilisés par Vecchia ;
+2.  calcule le facteur de précision ;
+3.  le transforme en matrice creuse `R_tilde`.
+
+```{r}
+NNarray = GpGp::find_ordered_nn( locs, nb_nn)
+
+Linv = GpGp::vecchia_Linv(
+  c( sigma2, range / sqrt(nu), nu, 0.0001),
+  "matern_isotropic",locs, NNarray
+)
+
+R_tilde = Matrix::sparseMatrix(
+  i = row(NNarray)[!is.na(NNarray)],
+  j = NNarray[!is.na(NNarray)],
+  x = Linv[!is.na(NNarray)],
+  triangular = TRUE
+)
+
+Q0 = Matrix::crossprod(R_tilde)
+dim(R_tilde)
+dim(Q0)
+```
+
+## 6. Simulation du champ latent
+
+### Rôle mathématique
+
+Comme
+
+$$ Q_0 = \widetilde R^\top\widetilde R, $$
+
+je peux générer le champ sans inverser explicitement (Q_0).
+
+Si
+
+$$ z\sim\mathcal N(0,I_n), $$
+
+alors on résout
+
+$$ \widetilde Rw=z. $$
+
+Ainsi,
+
+$$ w=\widetilde R^{-1}z $$
+
+possède approximativement la covariance spatiale recherchée.
+
+```{r}
+w = as.vector(Matrix::solve( R_tilde, rnorm(n) ) )
+summary(w)
+```
+
+## 7. Modèle Tobit avant censure
+
+### Principe du modèle
+
+Le modèle introduit d'abord une variable continue latente $(z_i)$ :
+
+$$ z_i = x_i^\top\beta+w_i+\varepsilon\_i, $$
+
+avec
+
+$$ \varepsilon\_i \sim \mathcal N(0,\tau^2). $$
+
+Ainsi,
+
+$$ z_i\mid w_i \sim \mathcal N \left( x_i^\top\beta+w_i, \tau^2
+\right). $$
+
+Cette variable `z_latent` ne correspond pas au champ spatial (w). Elle
+représente la réponse continue qui existerait en absence de censure.
+
+```{r}
+z_latent = as.vector( X %*% beta + w + sqrt(tau2) * rnorm(n))
+summary(z_latent)
+```
+
+## 8. Application de la censure
+
+### Principe
+
+Je considère ici une censure inférieure.
+
+Pour un seuil (c),
+
+$$y_i
+=
+\begin{cases}
+z_i, & z_i>c,\\
+c,   & z_i\leq c.
+\end{cases}$$
+
+Pour les observations censurées, la valeur exacte de $(z_i)$ n'est donc
+pas connue. On sait uniquement que
+
+$$ z_i\leq c. $$
+
+Pour cette première étude, je choisi le seuil comme un quantile de la
+distribution simulée afin de contrôler approximativement le taux de
+censure.
+
+Le choix `0.4` conduit ici à environ 40 % de valeurs censurées.
+
+```{r}
+censoring_rate = 0.40
+censoring_threshold = as.numeric( quantile( z_latent, probs = censoring_rate ) )
+is_censored = z_latent <= censoring_threshold
+y = pmax( z_latent, censoring_threshold)
+
+mean(is_censored)
+censoring_threshold
+summary(y)
+```
+
+## 9. Visualisation de la censure
+
+### Rôle du code
+
+Cette représentation permet de vérifier que la simulation correspond
+bien au mécanisme Tobit attendu.
+
+Les valeurs inférieures au seuil sont toutes remplacées par la même
+valeur observée.
+
+```{r}
+plot( z_latent, y, pch = 16, cex = 0.5,
+  xlab = "Variable continue latente z",
+  ylab = "Observation Tobit y",
+  main = "Effet de la censure Tobit"
+)
+
+abline( h = censoring_threshold, lty = 2 )
+```
+
+## 10. Log-postérieure du champ latent
+
+### Construction mathématique
+
+Je cherche maintenant
+
+$$ p(w\mid y). $$
+
+La contribution d'une observation dépend de son statut.
+
+### Observation non censurée
+
+Lorsque $(y_i>c)$,
+
+$$ y_i\mid w_i \sim \mathcal N( x_i^\top\beta+w_i, \tau^2). $$
+
+Sa contribution à la log-vraisemblance est donc une log-densité
+gaussienne.
+
+### Observation censurée
+
+Lorsque $(y_i=c)$, je sait uniquement que
+
+$$ z_i\leq c. $$
+
+La contribution devient
+
+$$ P(z_i\leq c\mid w_i) = \Phi(a_i), $$
+
+avec
+
+$$ a_i = \frac{
+c-x_i^\top\beta-w_i
+}{
+\sqrt{\tau^2}
+}. $$
+
+La log-vraisemblance contient donc
+
+$$ \log\Phi(a_i). $$
+
+Enfin, le prior apporte
+
+$$ -\frac12 \|\widetilde Rw\|^2. $$
+
+### Important numériquement
+
+J'utilise
+
+`pnorm(..., log.p = TRUE)`
+
+plutôt que de calculer `log(pnorm(...))`.
+
+Cela est beaucoup plus stable lorsque la probabilité de censure devient
+très petite.
+
+### Entrées
+
+- `w` : champ latent proposé ;
+- `R_tilde` : facteur de précision de Vecchia ;
+- `X`, `beta` : effets fixes ;
+- `y` : observations censurées ;
+- `tau2` : variance du bruit ;
+- `censoring_threshold` : seuil de censure ;
+- `is_censored` : indicateur des observations censurées.
+
+### Sortie
+
+Une valeur scalaire : la log-postérieure à une constante additive près.
+
+```{r}
+log_posterior_tobit = function( w, R_tilde, X, beta, y,
+    tau2, censoring_threshold, is_censored) {
+
+  mu = as.vector(X %*% beta + w)
+  sd_obs = sqrt(tau2)
+  uncensored = !is_censored
+  log_likelihood_uncensored = sum( dnorm( y[uncensored], mean = mu[uncensored],
+                                          sd = sd_obs, log = TRUE )
+  )
+
+  a = ( censoring_threshold - mu[is_censored] ) / sd_obs
+  log_likelihood_censored = sum( pnorm( a, log.p = TRUE ))
+  log_prior = -0.5 * sum( (R_tilde %*% w)^2 )
+  log_likelihood_uncensored + log_likelihood_censored + log_prior
+}
+```
+
+## 11. Calcul stable du rapport de Mills
+
+### Pourquoi cette fonction est nécessaire
+
+Le gradient pour une observation censurée fait intervenir
+
+$$ r(a) = \frac{\phi(a)}{\Phi(a)}, $$
+
+appelé rapport de Mills inverse.
+
+Calculer directement
+
+dnorm(a) / pnorm(a)
+
+peut provoquer des problèmes numériques lorsque `pnorm(a)` est
+extrêmement petit.
+
+Je travaille donc sur l'échelle logarithmique :
+
+$$ r(a) = \exp[
+\log\phi(a)-\log\Phi(a)
+]. $$
+
+```{r}
+inverse_mills_ratio = function(a) {
+  exp( dnorm(a, log = TRUE) - pnorm(a, log.p = TRUE) )
+}
+```
+
+## 12. Gradient de la log-postérieure
+
+### Expression mathématique
+
+Le prior contribue
+
+$$ -Q_0w. $$
+
+Pour une observation non censurée,
+
+$$ \frac{\partial}{\partial w_i} \log p(y_i\mid w_i) = \frac{
+y_i-x_i^\top\beta-w_i
+}{
+\tau^2
+}. $$
+
+Pour une observation censurée,
+
+$$ \frac{\partial}{\partial w_i} \log p(y_i\mid w_i) = -
+\frac{1}{\sqrt{\tau^2}} r(a_i). $$ Le gradient complet est donc
+
+$$ \nabla\log\pi(w\mid y) = -Q_0w+g(w). $$
+
+### Rôle du code
+
+Cette fonction est fondamentale :
+
+- Newton l'utilise pour calculer le MAP ;
+- MALA l'utilise pour orienter ses propositions.
+
+```{r}
+gradient_log_posterior_tobit = function( w, R_tilde, X, beta, y, tau2,
+                                         censoring_threshold, is_censored) {
+
+  mu = as.vector(X %*% beta + w)
+  sd_obs = sqrt(tau2)
+  gradient_likelihood = numeric(length(w))
+  uncensored = !is_censored
+  gradient_likelihood[uncensored] = ( y[uncensored] - mu[uncensored] ) / tau2
+  a = ( censoring_threshold - mu[is_censored] ) / sd_obs
+  mills = inverse_mills_ratio(a)
+  gradient_likelihood[is_censored] = -mills / sd_obs
+  gradient_prior = -as.vector( Matrix::crossprod( R_tilde, R_tilde %*% w ) )
+  gradient_likelihood + gradient_prior
+}
+```
+
+## 13. Validation numérique du gradient
+
+### Pourquoi cette vérification est indispensable
+
+Avant d'utiliser le gradient dans MALA, il faut vérifier qu'il
+correspond réellement à la dérivée de la log-postérieure.
+
+Une erreur de signe dans le terme censuré peut produire une chaîne qui
+semble fonctionner mais ne cible pas la bonne distribution.
+
+Je compare donc quelques composantes du gradient analytique à des
+différences finies :
+
+$$ \frac{
+\ell(w+h e_j)-\ell(w-h e_j)
+}{
+2h
+}. $$
+
+Les deux valeurs doivent être très proches.
+
+```{r}
+w_test = rep(0, n)
+
+grad_analytic = gradient_log_posterior_tobit( w = w_test, R_tilde = R_tilde, X = X,
+    beta = beta, y = y, tau2 = tau2,
+    censoring_threshold = censoring_threshold,
+    is_censored = is_censored
+  )
+
+indices_test = unique( round( seq( 1, n, length.out = 10 ) ))
+h = 1e-6
+
+grad_numeric = sapply(
+  indices_test,
+  function(j) {
+
+    w_plus = w_test
+    w_minus = w_test
+    w_plus[j] = w_plus[j] + h
+    w_minus[j] = w_minus[j] - h
+
+    (log_posterior_tobit( w_plus, R_tilde, X, beta, y,
+        tau2, censoring_threshold, is_censored
+      ) -
+      log_posterior_tobit( w_minus, R_tilde, X,
+        beta, y, tau2, censoring_threshold, is_censored )) / (2 * h)
+  }
+)
+
+gradient_check = data.frame(
+  index = indices_test,
+  analytic = grad_analytic[indices_test],
+  numeric = grad_numeric,
+  difference = grad_analytic[indices_test] - grad_numeric
+)
+
+gradient_check
+```
+
+On peut également regarder l'erreur maximale
+
+```{r}
+max( abs( gradient_check$difference ) )
+```
+
+Cette quantité doit être petite. Si ce test échoue, il ne faut pas
+poursuivre vers MALA avant d'avoir identifié l'erreur.
+
+## 14. Courbure de la vraisemblance Tobit
+
+### Expression mathématique
+
+Pour construire le préconditionnement au MAP, j'utilise la Hessienne.
+
+Pour une observation non censurée, la courbure négative de la
+log-vraisemblance vaut
+
+$$ d_i = \frac{1}{\tau^2}. $$
+
+Pour une observation censurée,
+
+$$ d_i = \frac{
+r(a_i)
+[
+a_i+r(a_i)
+]
+}{
+\tau^2
+}. $$
+
+On obtient donc
+
+$$ -\nabla^2\log\pi(w\mid y) = Q_0+D(w), $$
+
+où
+
+$$ D(w) = \operatorname{diag}(d_1,\ldots,d_n). $$
+
+La fonction suivante calcule uniquement le vecteur diagonal (d(w)). Cela
+évite de créer inutilement une matrice diagonale dense.
+
+```{r}
+tobit_likelihood_curvature = function( w, X, beta, tau2,
+                                        censoring_threshold, is_censored) {
+
+  mu = as.vector(X %*% beta + w)
+  sd_obs = sqrt(tau2)
+
+  d = numeric(length(w))
+
+  uncensored = !is_censored
+
+  d[uncensored] = 1 / tau2
+
+  a = ( censoring_threshold - mu[is_censored] ) / sd_obs
+
+  mills = inverse_mills_ratio(a)
+
+  d[is_censored] = mills * (a + mills) / tau2
+
+  d
+}
+```
+
+## 15. Calcul du MAP
+
+### Objectif
+
+Le MAP est
+
+$$ w\_{\mathrm{MAP}} = \arg\max\_w \log p(w\mid y). $$
+
+Il joue deux rôles :
+
+1.  fournir un bon point initial pour la chaîne ;
+2.  fournir le point auquel la courbure sera évaluée pour construire
+    $(Q_{\mathrm{MAP}})$.
+
+### Méthode de Newton
+
+À l'itération (k),
+
+$$ Q(w^{(k)}) = Q_0+D(w^{(k)}), $$
+
+puis
+
+$$ \Delta^{(k)} = Q(w^{(k)})^{-1} \nabla\log\pi(w^{(k)}\mid y). $$
+
+La proposition de Newton est
+
+$$ w^{(k+1)} = w^{(k)} + \Delta^{(k)}. $$
+
+Une recherche linéaire est ajoutée. Si le déplacement complet diminue la
+log-postérieure, le pas est progressivement divisé par deux.
+
+Cela rend l'optimisation plus robuste.
+
+```{r}
+find_map_tobit = function( R_tilde, X, beta, y, tau2, censoring_threshold,
+                           is_censored, w_initial = NULL, max_iter = 100, tol = 1e-6) {
+
+  n = length(y)
+  Q0 = Matrix::crossprod(R_tilde)
+
+  if (is.null(w_initial)) {
+    w_current = rep(0, n)
+  } else {
+    w_current = as.vector(w_initial)
+  }
+
+  for (iter in seq_len(max_iter)) {
+
+    grad = gradient_log_posterior_tobit( w = w_current, R_tilde = R_tilde,
+                                         X = X, beta = beta, y = y, tau2 = tau2,
+                                         censoring_threshold = censoring_threshold,
+                                         is_censored = is_censored
+      )
+
+    max_grad = max(abs(grad))
+    if (max_grad < tol) {
+      break
+    }
+
+    d = tobit_likelihood_curvature( w = w_current, X = X, beta = beta, tau2 = tau2,
+        censoring_threshold = censoring_threshold, is_censored = is_censored )
+    Q_current = Q0
+    Matrix::diag(Q_current) = Matrix::diag(Q_current) + d
+    chol_current = Matrix::Cholesky( Q_current, LDL = FALSE, perm = TRUE, super = FALSE )
+    delta = as.vector( Matrix::solve( chol_current, grad ) )
+    logpost_current = log_posterior_tobit( w_current, R_tilde, X, beta,
+                                           y, tau2, censoring_threshold, is_censored )
+    step = 1
+    repeat {
+      w_candidate =  w_current + step * delta
+      logpost_candidate = log_posterior_tobit( w_candidate, R_tilde, X, beta, y,
+                                               tau2, censoring_threshold, is_censored )
+
+      if (
+        is.finite(logpost_candidate) &&
+        logpost_candidate >= logpost_current
+      ) {
+        break
+      }
+      step = step / 2
+      if (step < 1e-8) {
+        break
+      }
+    }
+    w_current = w_current + step * delta
+  }
+
+  final_gradient = gradient_log_posterior_tobit( w = w_current, R_tilde = R_tilde,
+                                                 X = X, beta = beta, y = y, tau2 = tau2,
+                                                 censoring_threshold = censoring_threshold
+                                                 ,is_censored = is_censored
+    )
+
+  list(
+    w_map = w_current,
+    iterations = iter,
+    max_abs_gradient = max(abs(final_gradient)),
+    log_posterior = log_posterior_tobit( w_current, R_tilde, X, beta, y,
+                                         tau2, censoring_threshold, is_censored )
+  )
+}
+```
+
+## 16. Calcul et vérification du MAP
+
+### Rôle du code
+
+On exécute maintenant Newton.
+
+Le diagnostic le plus important est `max_abs_gradient`.
+
+Au MAP, je doit avoir approximativement
+
+$$ \nabla\log\pi(w_{\mathrm{MAP}}\mid y)=0. $$
+
+```{r}
+MAP = find_map_tobit( R_tilde = R_tilde, X = X, beta = beta, y = y,
+                      tau2 = tau2, censoring_threshold = censoring_threshold,
+                      is_censored = is_censored )
+
+MAP$iterations
+MAP$max_abs_gradient
+MAP$log_posterior
+
+w_map = MAP$w_map
+```
+
+Je peux également comparer visuellement le MAP au champ simulé.
+
+```{r}
+plot( w, w_map, pch = 16,  cex = 0.5,
+  xlab = "Champ latent simulé",
+  ylab = "MAP",
+  main = "Champ simulé et MAP"
+)
+
+abline( 0, 1, lty = 2)
+```
+
+## 17. Construction de $(Q_{\mathrm{MAP}})$
+
+### Rôle mathématique
+
+Le préconditionnement `prior` utilise
+
+$$ Q_0 = \widetilde R^\top\widetilde R.$$
+
+Le préconditionnement `MAP` utilise
+
+$$ Q_{\mathrm{MAP}} = Q_0+ D(w_{\mathrm{MAP}}). $$
+
+Contrairement au modèle gaussien, $(Q_{\mathrm{MAP}})$ n'est pas la
+précision exacte de la loi postérieure.
+
+Il s'agit de la courbure négative de la log-postérieure évaluée au mode
+
+:   
+
+$$ Q_{\mathrm{MAP}} = - \nabla^2 \log\pi(w_{\mathrm{MAP}}\mid y). $$
+
+```{r}
+d_map = tobit_likelihood_curvature( w = w_map, X = X, beta = beta, tau2 = tau2,
+                                     censoring_threshold = censoring_threshold,
+                                     is_censored = is_censored )
+
+Q_MAP = Q0
+Matrix::diag(Q_MAP) = Matrix::diag(Q_MAP) + d_map
+```
+
+## 18. Préparation des deux préconditionnements
+
+### Principe
+
+Deux stratégies seront comparées.
+
+### Préconditionnement a priori
+
+Il utilise seulement
+
+$$ Q_0. $$
+
+### Préconditionnement au MAP
+
+Il utilise
+
+$$ Q_{\mathrm{MAP}}. $$
+
+Dans les deux cas, une factorisation de Cholesky est calculée une seule
+fois avant la chaîne MCMC.
+
+```{r}
+conditioning_prior =
+  Matrix::expand(
+    Matrix::Cholesky(
+      Q0,
+      LDL = FALSE,
+      perm = TRUE,
+      super = FALSE
+    )
+  )
+
+conditioning_map =
+  Matrix::expand(
+    Matrix::Cholesky(
+      Q_MAP,
+      LDL = FALSE,
+      perm = TRUE,
+      super = FALSE
+    )
+  )
+```
+
+## 19. Composantes utilisées pour l'ESS
+
+### Pourquoi ne pas stocker toute la chaîne ?
+
+Avec (n=10,000) et plusieurs milliers d'itérations, conserver toutes les
+valeurs de (w) pour toutes les chaînes devient coûteux en mémoire.
+
+La moyenne et la variance postérieures seront donc calculées **en
+ligne** sur les (n) composantes.
+
+En revanche, l'ESS nécessite une trajectoire temporelle. Je conserve
+donc les trajectoires d'un sous-ensemble de 100 composantes
+régulièrement réparties.
+
+```{r}
+ess_indices = unique( round( seq( 1, n, length.out = min(100, n) ) ) )
+length(ess_indices)
+```
+
+## 20. MALA préconditionné avec persistance du momentum
+
+### Principe général
+
+Cette fonction reprend la structure utilisée dans les modèles
+précédents.
+
+La cible change : il s'agit maintenant de la postérieure Tobit.
+
+Le momentum est partiellement rafraîchi :
+
+$$ p_{\mathrm{ref}} = \rho p + \sqrt{1-\rho^2},\xi. $$
+
+Ainsi :
+
+- $(\rho=0)$ correspond à un renouvellement complet ;
+- $(0<\rho<1)$ introduit une persistance ;
+- une valeur élevée de $(\rho)$ conserve davantage la direction
+  précédente.
+
+Le pas est adapté pendant le burn-in afin de viser un taux d'acceptation
+de
+
+$$ 0.574. $$
+
+Après le burn-in, l'adaptation est arrêtée.
+
+### Moyenne et variance en ligne
+
+Je ne stocke pas toutes les réalisations de (w).
+
+La moyenne et la variance sont mises à jour par l'algorithme de Welford.
+
+À la fin :
+
+- `mean_w` contient la moyenne postérieure estimée ;
+- `variance_w` contient la variance marginale postérieure estimée ;
+- `sd_w` contient son écart-type ;
+- les ESS résument le mélange de la chaîne.
+
+```{r}
+fct_mala_precond_momentum_tobit = function( R_tilde, X, beta, y, tau2,
+                                            censoring_threshold, is_censored, n_iter,
+                                            burn_in, rho, conditioning_mat,
+                                            w_initial, ess_indices) {
+
+  s = 1
+  n = length(y)
+  target_accept = 0.574
+
+  P = conditioning_mat$P
+  L = conditioning_mat$L
+
+  if (is.null(P)) {
+    P = Matrix::Diagonal(nrow(L))
+  }
+
+  solveCond = function(v) {
+    as.vector(Matrix::crossprod(P, Matrix::solve(Matrix::t(L),Matrix::solve(L,P %*% v))))
+  }
+
+  solveCholCond = function() {
+    as.vector(Matrix::crossprod( P, L %*% rnorm(n)) )
+  }
+
+  logpi = function(w) {
+    log_posterior_tobit( w = w, R_tilde = R_tilde, X = X, beta = beta, y = y,
+                         tau2 = tau2, censoring_threshold = censoring_threshold,
+                         is_censored = is_censored
+    )
+  }
+
+  grad = function(w) {
+    gradient_log_posterior_tobit( w = w, R_tilde = R_tilde, X = X,beta = beta,
+                                  y = y, tau2 = tau2, censoring_threshold = 
+                                  censoring_threshold, is_censored = is_censored )
+  }
+
+  kinetic = function(p) {
+    0.5 *  as.numeric( Matrix::crossprod( p, solveCond(p) ))
+  }
+
+  H = function(w, p) {
+    -logpi(w) + kinetic(p)
+  }
+
+  w = as.vector(w_initial)
+  p = solveCholCond()
+  log_s = log(s)
+  n_post = n_iter - burn_in
+  mean_w = numeric(n)
+  M2_w = numeric(n)
+
+  trace_ess = matrix( NA_real_, nrow = n_post, ncol = length(ess_indices) )
+  accept = integer(n_iter)
+  s_history = numeric(n_iter)
+
+  compteur_post = 0L
+
+  for (i in seq_len(n_iter)) {
+    eps = exp(log_s)
+    accepte = 0L
+    p_ref = rho * p + sqrt(1 - rho^2) * solveCholCond()
+    p_half = p_ref + (eps / 2) * grad(w)
+    w_prop = w + eps * solveCond(p_half)
+    p_prop = p_half + (eps / 2) * grad(w_prop)
+    log_alpha = -H(w_prop, p_prop) + H(w, p_ref)
+
+    log_acc =
+      if (is.finite(log_alpha)) {
+        min(0, log_alpha)
+      } else {
+        -Inf
+      }
+
+    if (
+      log(runif(1)) <
+      log_acc
+    ) {
+
+      w = w_prop
+      p = p_prop
+      accepte = 1L
+
+    } else {
+      p = -p_ref
+    }
+
+    if (i <= burn_in) {
+      gamma = 1 / (i + 10)^0.6
+      log_s = log_s + gamma * ( accepte - target_accept )
+      log_s = max(log(1e-6), min( log_s, log(10) ))
+    }
+
+    accept[i] = accepte
+    s_history[i] = exp(log_s)
+
+    if (i > burn_in) {
+      compteur_post = compteur_post + 1L
+      delta = w - mean_w
+      mean_w = mean_w +  delta / compteur_post
+      M2_w =  M2_w + delta *( w - mean_w )
+      trace_ess[compteur_post, ] = w[ess_indices]
+    }
+  }
+
+  variance_w = M2_w / (compteur_post - 1)
+  sd_w = sqrt(variance_w)
+  ess = as.numeric( coda::effectiveSize( coda::as.mcmc(trace_ess ) ) )
+
+  ind_post = (burn_in + 1):n_iter
+  list( mean_w = mean_w, variance_w = variance_w, sd_w = sd_w,
+    ess_mean = mean( ess, na.rm = TRUE ),
+    ess_median = median( ess, na.rm = TRUE ),
+    ess_min = min( ess, na.rm = TRUE),
+    ess_max = max( ess, na.rm = TRUE),
+    accept_rate = mean(accept),
+    accept_rate_post = mean(accept[ind_post] ),
+    final_step = exp(log_s),
+    s_history = s_history
+  )
+}
+```
+
+## 21. Première chaîne avec préconditionnement au MAP
+
+### Pourquoi commencer par cette chaîne ?
+
+Avant tout plan factoriel, je vérifie qu'une seule chaîne fonctionne
+correctement.
+
+J'utilise :
+
+- le MAP comme état initial ;
+- $(Q_{\mathrm{MAP}})$ comme préconditionnement ;
+- $(\rho=0.5)$.
+
+Cette configuration n'est pas déclarée optimale pour le Tobit à ce
+stade. Elle constitue seulement une configuration de validation.
+
+```{r}
+set.seed(123)
+
+MCMC_map =
+  fct_mala_precond_momentum_tobit(
+    R_tilde = R_tilde,
+    X = X,
+    beta = beta,
+    y = y,
+    tau2 = tau2,
+    censoring_threshold = censoring_threshold,
+    is_censored = is_censored,
+    n_iter = n_iter,
+    burn_in = burn_in,
+    rho = 0.5,
+    conditioning_mat = conditioning_map,
+    w_initial = w_map,
+    ess_indices = ess_indices
+  )
+```
+
+## 22. Diagnostics de la chaîne
+
+### Rôle
+
+Je vérifie maintenant :
+
+- le taux d'acceptation global ;
+- le taux après burn-in ;
+- le pas final ;
+- les ESS.
+
+Un fonctionnement numérique sans erreur ne suffit pas : ces indicateurs
+permettent de vérifier que la chaîne se déplace effectivement.
+
+```{r}
+MCMC_map$accept_rate
+MCMC_map$accept_rate_post
+MCMC_map$final_step
+
+MCMC_map$ess_mean
+MCMC_map$ess_median
+MCMC_map$ess_min
+MCMC_map$ess_max
+```
+
+## 23. Vérification de l'adaptation du pas
+
+### Rôle du graphique
+
+Pendant le burn-in, le pas est modifié par Robbins--Monro.
+
+Après l'itération `burn_in`, il doit rester constant
+
+```{r}
+plot( MCMC_map$s_history, type = "l",
+  xlab = "Itération",
+  ylab = "Pas",
+  main = "Adaptation du pas MALA"
+)
+
+abline( v = burn_in, lty = 2 )
+```
+
+## 24. Reconstruction du champ latent
+
+### Quantités étudiées
+
+La chaîne permet maintenant d'obtenir :
+
+$$ \widehat{\mu}_i = E[w_i\mid y] $$ et
+
+$$ \widehat v_i = \operatorname{Var}(w_i\mid y). $$
+
+La première mesure la reconstruction du champ.
+
+La seconde mesure l'incertitude postérieure et ne doit pas être
+interprétée comme une erreur de reconstruction.
+
+```{r}
+mean_w = MCMC_map$mean_w
+variance_w = MCMC_map$variance_w
+sd_w = MCMC_map$sd_w
+```
+
+## 25. Critères de reconstruction
+
+### Rôle
+
+Dans une simulation, le véritable champ (w) est connu.
+
+Je peux donc calculer :
+
+### RMSE
+
+$$ \mathrm{RMSE} = \sqrt{
+\frac1n
+\sum_i
+(w_i-\widehat\mu_i)^2
+}. $$
+
+### MAE
+
+$$ \mathrm{MAE} = \frac1n \sum_i \|w_i-\widehat\mu_i\|. $$
+
+### Corrélation
+
+Elle mesure la capacité à retrouver l'organisation spatiale générale du
+champ.
+
+```{r}
+rmse_w = sqrt( mean( (w - mean_w)^2 ) )
+mae_w = mean( abs( w - mean_w ) )
+cor_w = cor( w, mean_w )
+
+rmse_w
+mae_w
+cor_w
+```
+
+# 26. Visualisation spatiale avec GeoNonStat
+
+## Rôle du code
+
+Pour conserver la même représentation graphique que dans les modèles
+gaussien et binaire, les champs spatiaux sont représentés avec la
+fonction `plotPointillistPainting` du package `GeoNonStat`.
+
+Cette fonction associe à chaque position spatiale une couleur dépendant
+de la valeur de la variable représentée.
+
+Dans le cas Tobit, quatre quantités sont visualisées :
+
+1.  les observations Tobit après application de la censure ;
+2.  le véritable champ latent simulé (w) ;
+3.  la moyenne postérieure estimée du champ latent ;
+4.  la variance postérieure marginale estimée.
+
+Ces quatre représentations permettent de distinguer les données
+effectivement observées, le champ que l'on cherche à reconstruire, son
+estimation et l'incertitude associée à cette estimation.
+
+```{r}
+GeoNonStat::plotPointillistPainting(locs, y, cex = 20)
+title("Observations Tobit censurées")
+```
+
+```{r}
+GeoNonStat::plotPointillistPainting( locs, w, cex = 20)
+title("Champ latent simulé")
+```
+
+```{r}
+GeoNonStat::plotPointillistPainting( locs, mean_w, cex = 20)
+title("Moyenne postérieure")
+```
+
+```{r}
+GeoNonStat::plotPointillistPainting( locs, variance_w, cex = 20)
+title("Variance postérieure")
+```
+
+## 28. Comparaison prior contre MAP
+
+### Objectif
+
+Une fois la chaîne MAP validée, Je peux exécuter exactement la même
+chaîne avec $(Q_0)$.
+
+Les données, l'état initial, le nombre d'itérations et $(\rho)$ restent
+identiques.
+
+La seule différence est donc le préconditionnement.
+
+```{r}
+set.seed(123)
+
+MCMC_prior =
+  fct_mala_precond_momentum_tobit( R_tilde = R_tilde, X = X, beta = beta, y = y,
+    tau2 = tau2, censoring_threshold = censoring_threshold, is_censored = is_censored,
+    n_iter = n_iter, burn_in = burn_in,
+    rho = 0.5, conditioning_mat = conditioning_prior,
+    w_initial = w_map, ess_indices = ess_indices
+  )
+```
+
+## 29. Tableau de comparaison
+
+### Rôle
+
+Ce petit tableau constitue le premier test de l'intérêt de
+(Q\_{\mathrm{MAP}}) dans le modèle Tobit.
+
+Il ne permet pas encore de conclure globalement : une seule simulation
+ne suffit pas.
+
+```{r}
+comparison =
+  data.frame( conditioning = c( "Prior", "MAP"),
+    ess_mean = c( MCMC_prior$ess_mean, MCMC_map$ess_mean ),
+    ess_median = c( MCMC_prior$ess_median, MCMC_map$ess_median ),
+    ess_min = c( MCMC_prior$ess_min, MCMC_map$ess_min ),
+    accept_rate_post = c( MCMC_prior$accept_rate_post, MCMC_map$accept_rate_post ),
+    final_step = c( MCMC_prior$final_step, MCMC_map$final_step )
+  )
+
+comparison
+```
+
+## 30. Préparation du plan factoriel
+
+### Objectif
+
+Une fois toutes les vérifications précédentes réussies, je peux passer
+d'une configuration unique à un plan factoriel.
+
+Le Tobit introduit un paramètre supplémentaire particulièrement
+intéressant : le **niveau de censure**.
+
+Celui-ci modifie directement la quantité d'information disponible dans
+les observations.
+
+Je pourrai par exemple comparer plusieurs taux :
+
+$$ 20%,\qquad40%,\qquad60%. $$
+
+Pour éviter un lancement accidentel très coûteux, le plan est construit
+ici mais pas encore exécuté.
+
+```{r}
+experiment_parameters =
+  as.matrix(
+    expand.grid(
+      sigma2 = c( 0.5, 1, 2 ),
+      nu = c( 0.5, 1.5 ),
+      range = c( 0.05, 0.2, 0.5 ),
+      tau2 = c( 0.5, 1, 2 ),
+      censoring_rate =  c( 0.2, 0.4, 0.6 ),
+      rho = c( 0, 0.5, 0.9 ),
+      conditioning = c( 1, 2 ),
+      seed = seq(5)
+    )
+  )
+
+nrow(experiment_parameters)
+```
+
+# 31. Signification du codage du préconditionnement
+
+Pour conserver une structure proche des programmes précédents :
+
+- `conditioning = 1` désignera le préconditionnement a priori $(Q_0)$ ;
+- `conditioning = 2` désignera le préconditionnement
+  $(Q_{\mathrm{MAP}})$.
+
+Il est préférable de ne pas utiliser `conditioning = 0` pour une
+identité tant que celle-ci ne fait pas explicitement partie de la
+question scientifique étudiée.
+
+## 32. Contrôles obligatoires avant le plan factoriel
+
+Avant de lancer l'expérience complète, vérifier les points suivants.
+
+1.  Le taux de censure observé correspond approximativement au taux
+    demandé.
+
+2.  Le test par différences finies valide le gradient.
+
+3.  Le MAP converge et `max_abs_gradient` est suffisamment petit.
+
+4.  $(Q_0)$ et $(Q_{\mathrm{MAP}})$ peuvent être factorisées sans
+    erreur.
+
+5.  Le taux d'acceptation post burn-in est raisonnable.
+
+6.  Le pas devient constant après le burn-in.
+
+7.  Les ESS sont finis et positifs.
+
+8.  `mean_w` et `variance_w` ne contiennent pas de `NA`.
+
+9.  Les quatre cartes spatiales sont cohérentes.
+
+10. Les chaînes `Prior` et `MAP` utilisent exactement le même jeu de
+    données et la même initialisation lorsqu'elles sont comparées.
+
+## 33. Sorties à conserver pour chaque expérience
+
+Pour le plan factoriel final, il sera utile de conserver au minimum :
+
+- `sigma2` ;
+- `nu` ;
+- `range` ;
+- `tau2` ;
+- `censoring_rate` ;
+- `rho` ;
+- `conditioning` ;
+- `seed` ;
+- taux de censure réellement obtenu ;
+- `accept_rate` ;
+- `accept_rate_post` ;
+- `final_step` ;
+- `ess_mean` ;
+- `ess_median` ;
+- `ess_min` ;
+- `ess_max` ;
+- RMSE du champ ;
+- MAE du champ ;
+- corrélation entre champ simulé et moyenne postérieure ;
+- variance postérieure moyenne ;
+- temps de calcul.
+
+Les champs complets `mean_w` et `variance_w` n'ont pas besoin d'être
+conservés pour toutes les chaînes si l'objectif est uniquement l'analyse
+factorielle. Ils peuvent être sauvegardés seulement pour les
+configurations choisies pour les figures de reconstruction.
+
+## 34. Résumé méthodologique
+
+Le modèle Tobit peut être résumé par
+
+$$ w \sim \mathcal N(0,Q_0^{-1}), $$
+
+$$ z_i = x_i^\top\beta+w_i+\varepsilon_i, \qquad
+\varepsilon_i\sim\mathcal N(0,\tau^2), $$
+
+et, pour une censure inférieure,
+
+$$ y_i = \max(c,z_i). $$
+
+La censure modifie la vraisemblance et rend la postérieure du champ
+latent non gaussienne.
+
+Sa géométrie locale est décrite par
+
+$$ -\nabla^2 \log\pi(w\mid y) = Q_0+D(w). $$
+
+Le mode fournit alors
+
+$$ Q_{\mathrm{MAP}} = Q_0+ D(w_{\mathrm{MAP}}). $$
+
+Cette matrice est utilisée comme préconditionnement fixe de MALA.
+
+L'expérience permettra finalement de déterminer si l'utilisation de
+cette information locale améliore l'efficacité et la robustesse de
+l'échantillonnage lorsque le niveau de censure, les paramètres spatiaux
+et la persistance du momentum varient.
+
+```{r}
+cl = parallel::makeCluster( max(1, floor(parallel::detectCores() * 0.5)))
+parallel::clusterExport(
+  cl,
+  varlist = c(
+    "experiment_parameters",
+    "dimension",
+    "n",
+    "nb_nn",
+    "n_iter",
+    "burn_in",
+    "beta",
+    "createLocs",
+    "inverse_mills_ratio",
+    "log_posterior_tobit",
+    "gradient_log_posterior_tobit",
+    "tobit_likelihood_curvature",
+    "find_map_tobit",
+    "fct_mala_precond_momentum_tobit"
+  ),
+  envir = .GlobalEnv
+)
+
+experiment_results = parallel::parLapply(
+  cl = cl,
+  X = split( experiment_parameters, row(experiment_parameters) ),
+  fun = function(params) {
+    
+    names(params) = colnames(experiment_parameters)
+    
+    sigma2 = as.numeric(params["sigma2"])
+    nu = as.numeric(params["nu"])
+    range = as.numeric(params["range"])
+    tau2 = as.numeric(params["tau2"])
+    censoring_rate = as.numeric(params["censoring_rate"])
+    rho = as.numeric(params["rho"])
+    conditioning = as.integer(params["conditioning"])
+    seed = as.integer(params["seed"])
+    
+    set.seed(seed)
+    
+    locs = createLocs(dimension, n)
+    X = cbind( 1, rnorm(n) )
+    NNarray = GpGp::find_ordered_nn( locs, nb_nn )
+    Linv = GpGp::vecchia_Linv(
+      c( sigma2, range / sqrt(nu), nu, 0.0001 ),
+      "matern_isotropic", locs, NNarray
+    )
+    
+    R_tilde = Matrix::sparseMatrix(
+      i = row(NNarray)[!is.na(NNarray)],
+      j = NNarray[!is.na(NNarray)],
+      x = Linv[!is.na(NNarray)],
+      triangular = TRUE
+    )
+    
+    Q0 = Matrix::crossprod(R_tilde)
+    w = as.vector( Matrix::solve( R_tilde, rnorm(n) ) )
+    z_latent = as.vector( X %*% beta + w + sqrt(tau2) * rnorm(n) )
+    censoring_threshold = as.numeric( quantile( z_latent, probs = censoring_rate ) )
+    is_censored = z_latent <= censoring_threshold
+    y = pmax( z_latent, censoring_threshold )
+  
+    MAP = find_map_tobit(
+      R_tilde = R_tilde,
+      X = X,
+      beta = beta,
+      y = y,
+      tau2 = tau2,
+      censoring_threshold = censoring_threshold,
+      is_censored = is_censored
+    )
+    
+    w_map = MAP$w_map
+    
+    if (conditioning == 1) {
+      conditioning_matrix = Q0
+    } else if (conditioning == 2) {
+      
+      d_map = tobit_likelihood_curvature(
+        w = w_map,
+        X = X,
+        beta = beta,
+        tau2 = tau2,
+        censoring_threshold = censoring_threshold,
+        is_censored = is_censored
+      )
+      
+      conditioning_matrix = Q0
+      Matrix::diag(conditioning_matrix) = Matrix::diag(conditioning_matrix) + d_map
+    }
+    
+    conditioning_mat =
+      Matrix::expand(Matrix::Cholesky(conditioning_matrix,LDL=FALSE,perm=TRUE,super=FALSE)
+                     )
+    ess_indices = unique( round( seq( 1, n, length.out = min(100, n) ) ))
+  
+    MCMC =
+      fct_mala_precond_momentum_tobit( R_tilde = R_tilde, X = X, beta = beta,
+        y = y, tau2 = tau2, censoring_threshold = censoring_threshold,
+        is_censored = is_censored, n_iter = n_iter, burn_in = burn_in,
+        rho = rho, conditioning_mat = conditioning_mat, w_initial = w_map,
+        ess_indices = ess_indices
+      )
+    rmse_w = sqrt( mean((w - MCMC$mean_w)^2) )
+    mae_w = mean( abs( w - MCMC$mean_w ) )
+    cor_w = cor( w, MCMC$mean_w )
+    
+    c(
+      sigma2 = sigma2,
+      nu = nu,
+      range = range,
+      tau2 = tau2,
+      censoring_rate = censoring_rate,
+      actual_censoring_rate = mean(is_censored),
+      rho = rho,
+      conditioning = conditioning,
+      seed = seed,
+      
+      map_iterations = MAP$iterations,
+      map_max_gradient = MAP$max_abs_gradient,
+      
+      accept_rate = MCMC$accept_rate,
+      accept_rate_post = MCMC$accept_rate_post,
+      final_step = MCMC$final_step,
+      
+      ess_mean = MCMC$ess_mean,
+      ess_median = MCMC$ess_median,
+      ess_min = MCMC$ess_min,
+      ess_max = MCMC$ess_max,
+      
+      rmse_w = rmse_w,
+      mae_w = mae_w,
+      cor_w = cor_w,
+      mean_posterior_variance = mean(MCMC$variance_w)
+    )
+  }
+)
+
+parallel::stopCluster(cl)
+```
+
+```{r}
+experiment_results =as.data.frame(do.call(rbind,experiment_results))
+rownames(experiment_results) = NULL
+dim(experiment_results)
+head(experiment_results)
+
+write.csv(
+  experiment_results,
+  file = paste0(
+    "tobit_experiment_results_dim",
+    dimension,
+    ".csv"
+  ),
+  row.names = FALSE
+)
+
+#experiment_results =readRDS("tobit_experiment_results.rds")
+```
+
+## 35. Vérification des résultats du plan factoriel
+
+### Rôle du code
+
+Avant toute analyse, il est important de vérifier que toutes les chaînes
+attendues ont bien été exécutées et qu'aucune valeur manquante ou non
+finie n'est apparue.
+
+Le plan factoriel contient normalement 4 860 configurations.
+
+```{r}
+dim(experiment_results)
+names(experiment_results)
+colSums( !is.finite( as.matrix(experiment_results) ) )
+```
+
+Je vérifie également que les différents niveaux du plan factoriel sont
+bien présents.
+
+```{r}
+table(experiment_results$conditioning)
+
+table(experiment_results$rho)
+
+table(experiment_results$censoring_rate)
+```
+
+Enfin, le taux de censure réellement obtenu peut être comparé au taux
+demandé.
+
+```{r}
+aggregate(
+  actual_censoring_rate ~ censoring_rate,
+  data = experiment_results,
+  FUN = mean
+)
+```
+
+Comme le seuil de censure est construit à partir d'un quantile de la
+variable continue latente, les deux valeurs doivent être très proches.
+
+## 36. Identification des préconditionnements
+
+### Rôle du code
+
+Dans le plan factoriel :
+
+- `conditioning = 1` correspond au préconditionnement a priori $(Q_0)$ ;
+- `conditioning = 2` correspond au préconditionnement
+  $(Q_{\mathrm{MAP}})$.
+
+Pour faciliter les figures et les tableaux, je crée une variable
+contenant directement le nom de la stratégie.
+
+```{r}
+experiment_results$conditioning_name =
+  factor(
+    experiment_results$conditioning,
+    levels = c(1, 2),
+    labels = c("Prior", "MAP")
+  )
+```
+
+Je fait également de `rho` un facteur pour les représentations
+graphiques.
+
+```{r}
+experiment_results$rho_factor =
+  factor(
+    experiment_results$rho,
+    levels = c(0, 0.5, 0.9)
+  )
+```
+
+## 37. Résumé global des performances MCMC
+
+### Objectif
+
+La première analyse consiste à comparer les stratégies en agrégeant les
+résultats sur l'ensemble des paramètres du modèle Tobit.
+
+Pour chaque combinaison de $(\rho)$ et de préconditionnement, on calcule :
+
+- l'ESS médian moyen ;
+- l'ESS moyen ;
+- l'ESS minimal moyen ;
+- le taux d'acceptation après burn-in ;
+- le pas final ;
+- la RMSE de reconstruction ;
+- la MAE ;
+- la corrélation entre le champ simulé et sa reconstruction.
+
+Cette première synthèse donne une vue globale de la performance des
+algorithmes.
+
+```{r}
+results_summary =
+  aggregate(
+    cbind(
+      ess_median,
+      ess_min,
+      ess_mean,
+      accept_rate_post,
+      final_step,
+      rmse_w,
+      mae_w,
+      cor_w,
+      mean_posterior_variance
+    ) ~
+      rho +
+      conditioning,
+    data = experiment_results,
+    FUN = mean
+  )
+
+results_summary
+```
+
+## 38. ESS médian : efficacité globale de l'échantillonnage
+
+### Interprétation
+
+L'ESS mesure le nombre d'échantillons indépendants équivalents contenus
+dans une chaîne autocorrélée.
+
+Une valeur élevée indique donc un meilleur mélange.
+
+L'ESS médian est utilisé comme indicateur principal car il est moins
+sensible aux composantes exceptionnellement faciles ou difficiles que
+l'ESS moyen.
+
+```{r}
+ggplot(
+  experiment_results,
+  aes(
+    x = factor(rho),
+    y = ess_median,
+    fill = conditioning_name
+  )
+) +
+  geom_boxplot() +
+  labs(
+    x = expression(rho),
+    y = "ESS médian",
+    fill = "Préconditionnement",
+    title = "Efficacité globale de l'échantillonnage"
+  ) +
+  theme_minimal()
+```
+
+## 39. Robustesse : quantile inférieur (Q\_{10})
+
+### Pourquoi utiliser (Q\_{10}) ?
+
+Une stratégie peut présenter un ESS moyen élevé tout en échouant sur
+certaines configurations difficiles.
+
+Pour étudier cette robustesse, on utilise le premier décile de l'ESS
+médian :
+
+$$ Q_{10} = \operatorname{Quantile}*{0.10} (*
+\mathrm{ESS}{\mathrm{médian}} ). $$
+
+Un $(Q_{10})$ élevé signifie que même parmi les configurations les plus
+difficiles, la méthode conserve une efficacité raisonnable.
+
+```{r}
+q10_results =
+  aggregate(
+    ess_median ~
+      rho +
+      conditioning,
+    data = experiment_results,
+    FUN = function(x) {
+      quantile(
+        x,
+        probs = 0.10,
+        na.rm = TRUE
+      )
+    }
+  )
+
+names(q10_results)[3] = "Q10_ess_median"
+
+q10_results
+```
+
+Pour obtenir à la fois la performance centrale et la robustesse :
+
+```{r}
+performance_results =
+  merge(
+    results_summary,
+    q10_results,
+    by = c(
+      "rho",
+      "conditioning"
+    )
+  )
+
+performance_results
+```
+
+## 40. Effet de la persistance du momentum
+
+### Objectif
+
+Le paramètre $(\rho)$ contrôle la quantité de momentum conservée entre
+deux itérations.
+
+Les valeurs étudiées sont
+
+$$ \rho\in{0;0.5;0.9}. $$
+
+La valeur $(\rho=0)$ correspond à un renouvellement complet du momentum,
+tandis que les valeurs positives introduisent une persistance.
+
+L'objectif est de déterminer si cette persistance améliore effectivement
+le mélange dans le modèle Tobit et si son effet dépend du
+préconditionnement.
+
+```{r}
+rho_summary =
+  aggregate(
+    cbind(
+      ess_median,
+      ess_min,
+      ess_mean
+    ) ~
+      rho +
+      conditioning_name,
+    data = experiment_results,
+    FUN = mean
+  )
+
+rho_summary
+```
+
+## 41. Effet du taux de censure
+
+### Motivation
+
+Le taux de censure constitue une caractéristique propre à l'application
+Tobit.
+
+Lorsque le taux de censure augmente, une proportion plus importante des
+variables continues sous-jacentes n'est plus observée exactement.
+
+Pour une observation censurée, on sait uniquement que
+
+$$ z_i\leq c. $$
+
+L'information disponible est donc différente de celle fournie par une
+observation non censurée.
+
+Il est ainsi particulièrement intéressant d'étudier si l'efficacité de
+MALA se dégrade lorsque la proportion d'observations censurées augmente.
+
+```{r}
+censoring_summary =
+  aggregate(
+    cbind(
+      ess_median,
+      ess_min,
+      rmse_w,
+      mae_w,
+      cor_w,
+      mean_posterior_variance
+    ) ~
+      censoring_rate +
+      rho +
+      conditioning,
+    data = experiment_results,
+    FUN = mean
+  )
+
+censoring_summary
+```
+
+## 42. ESS en fonction du taux de censure
+
+### Rôle de la figure
+
+Cette figure permet de visualiser directement l'effet de la censure sur
+l'efficacité de l'échantillonnage.
+
+Les panneaux séparent les deux préconditionnements afin de distinguer
+leur comportement.
+
+```{r}
+ggplot(
+  experiment_results,
+  aes(
+    x = factor(censoring_rate),
+    y = ess_median,
+    fill = factor(rho)
+  )
+) +
+  geom_boxplot() +
+  facet_wrap(
+    ~ conditioning_name
+  ) +
+  labs(
+    x = "Taux de censure",
+    y = "ESS médian",
+    fill = expression(rho),
+    title = "Influence de la censure sur l'efficacité de MALA"
+  ) +
+  theme_minimal()
+```
+
+## 43. Qualité de reconstruction du champ latent
+
+### RMSE
+
+La RMSE compare le véritable champ simulé (w) à sa moyenne postérieure
+estimée :
+
+$$ \operatorname{RMSE} = \sqrt{
+\frac{1}{n}
+\sum_{i=1}^{n}
+(
+w_i-\widehat w_i
+)^2
+}. $$
+
+Une valeur faible correspond à une meilleure reconstruction.
+
+```{r}
+ggplot(
+  experiment_results,
+  aes(
+    x = factor(rho),
+    y = rmse_w,
+    fill = conditioning_name
+  )
+) +
+  geom_boxplot() +
+  labs(
+    x = expression(rho),
+    y = "RMSE du champ latent",
+    fill = "Préconditionnement",
+    title = "Précision de la reconstruction du champ latent"
+  ) +
+  theme_minimal()
+```
+
+## 44. Reconstruction en fonction du taux de censure
+
+### Objectif
+
+Cette représentation permet d'étudier une question différente de celle
+de l'ESS.
+
+Même si une chaîne MCMC mélange correctement, la reconstruction du champ
+peut devenir plus difficile lorsque davantage d'observations sont
+censurées.
+
+```{r}
+ggplot(
+  experiment_results,
+  aes(
+    x = factor(censoring_rate),
+    y = rmse_w,
+    fill = conditioning_name
+  )
+) +
+  geom_boxplot() +
+  facet_wrap(
+    ~ rho_factor
+  ) +
+  labs(
+    x = "Taux de censure",
+    y = "RMSE du champ latent",
+    fill = "Préconditionnement",
+    title = "Effet de la censure sur la reconstruction"
+  ) +
+  theme_minimal()
+```
+
+## 45. Corrélation entre champ simulé et champ reconstruit
+
+### Interprétation
+
+La RMSE mesure les écarts d'amplitude tandis que la corrélation
+renseigne davantage sur la capacité de la méthode à retrouver la
+structure spatiale du champ.
+
+Une corrélation proche de 1 signifie que les variations spatiales
+principales du champ simulé sont bien retrouvées.
+
+```{r}
+ggplot(
+  experiment_results,
+  aes(
+    x = factor(censoring_rate),
+    y = cor_w,
+    fill = conditioning_name
+  )
+) +
+  geom_boxplot() +
+  facet_wrap(
+    ~ rho_factor
+  ) +
+  labs(
+    x = "Taux de censure",
+    y = "Corrélation",
+    fill = "Préconditionnement",
+    title = "Structure spatiale reconstruite"
+  ) +
+  theme_minimal()
+```
+
+## 46. Variance postérieure
+
+### Rôle de cet indicateur
+
+La variance postérieure marginale
+
+$$ \operatorname{Var}(w_i\mid y) $$
+
+mesure l'incertitude restante sur chaque composante du champ après prise
+en compte des observations.
+
+Pour résumer cette information à l'échelle d'une simulation, on utilise
+ici
+
+$$ \overline V_{\mathrm{post}} = \frac1n \sum_{i=1}^{n}
+\widehat{\operatorname{Var}}(w_i\mid y). $$
+
+Contrairement à la RMSE, cette quantité n'est pas une erreur : elle
+mesure l'incertitude postérieure estimée par la chaîne.
+
+```{r}
+ggplot(
+  experiment_results,
+  aes(
+    x = factor(censoring_rate),
+    y = mean_posterior_variance,
+    fill = conditioning_name
+  )
+) +
+  geom_boxplot() +
+  facet_wrap(
+    ~ rho_factor
+  ) +
+  labs(
+    x = "Taux de censure",
+    y = "Variance postérieure moyenne",
+    fill = "Préconditionnement",
+    title = "Incertitude postérieure et niveau de censure"
+  ) +
+  theme_minimal()
+```
+
+## 47. Taux d'acceptation
+
+### Objectif
+
+Le taux d'acceptation permet de vérifier que l'adaptation du pas produit
+un comportement comparable entre les différentes configurations.
+
+La cible utilisée pendant le burn-in est 0.574.
+
+```{r}
+ggplot(
+  experiment_results,
+  aes(
+    x = factor(rho),
+    y = accept_rate_post,
+    fill = conditioning_name
+  )
+) +
+  geom_boxplot() +
+  geom_hline(
+    yintercept = 0.574,
+    linetype = 2
+  ) +
+  labs(
+    x = expression(rho),
+    y = "Taux d'acceptation post burn-in",
+    fill = "Préconditionnement",
+    title = "Taux d'acceptation des chaînes Tobit"
+  ) +
+  theme_minimal()
+```
+
+## 48. Recherche de la meilleure stratégie
+
+### Principe
+
+La meilleure stratégie ne doit pas être déterminée uniquement à partir
+de l'ESS moyen.
+
+On considère conjointement :
+
+- l'ESS médian ;
+- l'ESS minimal ;
+- $(Q_{10})$ ;
+- la RMSE ;
+- la stabilité lorsque le taux de censure varie.
+
+Le tableau suivant classe d'abord les stratégies selon leur ESS médian
+moyen.
+
+```{r}
+performance_results = performance_results[ order( -performance_results$ess_median ), ]
+
+performance_results
+```
+
+## 49. Analyse détaillée par taux de censure
+
+### Pourquoi cette analyse est importante ?
+
+Une stratégie globalement performante peut être excellente lorsque
+seulement 20 % des observations sont censurées mais devenir moins
+robuste à 60 %.
+
+On calcule donc les indicateurs séparément pour chaque niveau de
+censure.
+
+```{r}
+performance_by_censoring =
+  aggregate(
+    cbind(
+      ess_median,
+      ess_min,
+      ess_mean,
+      rmse_w,
+      mae_w,
+      cor_w,
+      mean_posterior_variance
+    ) ~
+      censoring_rate +
+      rho +
+      conditioning,
+    data = experiment_results,
+    FUN = mean
+  )
+
+performance_by_censoring
+```
+
+Le $(Q_{10})$ correspondant est :
+
+```{r}
+q10_by_censoring =
+  aggregate(
+    ess_median ~
+      censoring_rate +
+      rho +
+      conditioning,
+    data = experiment_results,
+    FUN = function(x) {
+      quantile( x, 0.10, na.rm = TRUE )
+    }
+  )
+
+names(q10_by_censoring)[4] = "Q10_ess_median"
+
+q10_by_censoring
+```
+
+## 50. Choix des configurations pour la reconstruction spatiale
+
+### Principe
+
+Les 4 860 simulations servent à évaluer globalement les stratégies MCMC.
+Il n'est ni nécessaire ni souhaitable de produire quatre cartes pour
+chaque chaîne.
+
+Comme dans les applications gaussienne et binaire, seules quelques
+configurations représentatives seront retenues pour les illustrations.
+
+On peut conserver trois situations :
+
+- une structure spatiale courte et relativement faible ;
+- une situation intermédiaire ;
+- une structure spatiale plus forte et plus régulière.
+
+Le taux de censure peut être fixé dans un premier temps à 40 %, ce qui
+correspond à une situation intermédiaire.
+
+```{r}
+selected_configs =
+  data.frame(
+    configuration = 1:3,
+    sigma2 = c( 0.5, 1, 2),
+    nu = c( 0.5, 1.5, 1.5),
+    range = c( 0.05, 0.2, 0.5 ),
+    tau2 = c( 1, 1, 1 ),
+    censoring_rate = c( 0.4, 0.4, 0.4 )
+    )
+
+selected_configs
+```
+
+
+
+## 51. Figures à produire pour chaque configuration retenue
+
+Pour chacune des trois configurations sélectionnées, quatre cartes
+seront produites avec `GeoNonStat::plotPointillistPainting`.
+
+Elles correspondent à :
+
+1.  l'observation Tobit censurée ;
+2.  le champ latent simulé ;
+3.  la moyenne postérieure estimée ;
+4.  la variance postérieure marginale estimée.
+
+Le format reste ainsi identique à celui utilisé dans les modèles
+gaussien et binaire.
+
+```{r eval=false}
+png(filename = "tobit_config1_observed.png")
+GeoNonStat::plotPointillistPainting( locs, y, cex = 20 )
+dev.off()
+png( filename = "tobit_config1_latent.png" )
+
+GeoNonStat::plotPointillistPainting( locs, w, cex = 20 )
+dev.off()
+png( filename = "tobit_config1_estimated_mean.png")
+
+GeoNonStat::plotPointillistPainting(locs, MCMC$mean_w, cex = 20)
+dev.off()
+png(filename = "tobit_config1_posterior_variance.png")
+GeoNonStat::plotPointillistPainting( locs, MCMC$variance_w, cex = 20)
+
+dev.off()
+```
+
+Le bloc est laissé avec `eval=false` à ce stade car `locs`, `w`, `y` et
+`MCMC` doivent provenir de la configuration précise que l'on souhaite
+illustrer.
+
+## 52. Tableau final à utiliser dans le mémoire
+
+Une fois les simulations terminées, le tableau principal pourra être
+construit à partir des indicateurs suivants :
+
+```{r}
+final_summary =
+  aggregate(
+    cbind(
+      ess_median,
+      ess_min,
+      ess_mean,
+      rmse_w,
+      mae_w,
+      cor_w,
+      mean_posterior_variance
+    ) ~
+      rho +
+      conditioning,
+    data = experiment_results,
+    FUN = mean
+  )
+
+final_q10 =
+  aggregate(
+    ess_median ~
+      rho +
+      conditioning,
+    data = experiment_results,
+    FUN = function(x) {
+      quantile( x, 0.10, na.rm = TRUE )
+    }
+  )
+
+names(final_q10)[3] = "Q10"
+final_summary = merge( final_summary, final_q10, by = c( "rho", "conditioning" ) )
+
+final_summary
+```
+
+## 53. Ce que l'analyse devra permettre de conclure
+
+À l'issue de l'expérience factorielle, quatre questions principales
+devront être examinées.
+
+Premièrement, on cherchera à déterminer si le préconditionnement
+construit à partir de la courbure au MAP améliore l'ESS par rapport au
+préconditionnement a priori.
+
+Deuxièmement, l'effet de la persistance du momentum sera étudié afin de
+déterminer si une valeur intermédiaire de $(\rho)$ améliore le mélange ou
+si une persistance trop importante devient défavorable.
+
+Troisièmement, le modèle Tobit permettra d'étudier spécifiquement
+l'effet de la censure. L'évolution de l'ESS, de la RMSE et de la
+variance postérieure lorsque le taux de censure passe de 20 % à 60 %
+permettra de caractériser la difficulté supplémentaire introduite par la
+perte d'information.
+
+Enfin, le critère $(Q_{10})$ permettra de distinguer la performance
+moyenne de la robustesse. La stratégie retenue pour le mémoire devra
+présenter non seulement de bonnes performances moyennes, mais également
+un comportement stable sur les configurations les plus difficiles.

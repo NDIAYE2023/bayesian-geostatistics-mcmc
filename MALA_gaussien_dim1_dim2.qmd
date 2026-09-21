@@ -1,0 +1,1320 @@
+---
+title: "Tests de MALA préconditionné dans le cas gaussien"
+format:
+  html:
+    number-sections: true
+    toc: true
+    toc-depth: 3
+    code-summary: "Afficher le code"
+execute:
+  warning: false
+  message: false
+editor:
+  markdown:
+    wrap: 72
+---
+
+# Performances de MALA dans le cas gaussien
+
+Ce document regroupe les tests réalisés pour valider l'algorithme MALA
+avec préconditionnement et rafraîchissement partiel du momentum. Je
+commence par simuler un modèle gaussien latent, puis je vérifie la
+solution analytique et les opérations associées aux trois
+conditionnements. Enfin, je compare les résultats MCMC et j'étudie
+l'influence des paramètres à l'aide d'une expérience factorielle.
+
+Les trois conditionnements considérés sont l'identité, la précision a
+priori et la précision a posteriori. Le code est écrit pour la
+dimension 1. Pour passer en dimension 2, il faudra principalement
+modifier la construction de `locs` et les graphiques et les noms des
+fichiers .
+
+## Conventions
+
+| Code | Nom       | Matrice                   |
+|-----:|-----------|---------------------------|
+|    0 | identité  | $I$                       |
+|    1 | prior     | $Q_0=R^\top R$            |
+|    2 | posterior | $Q_{post}=Q_0+\tau^{-2}I$ |
+
+Dans le cas gaussien :
+
+$$y=X\beta+w+\varepsilon,\qquad \varepsilon\sim\mathcal N(0,\tau^2I).$$
+
+Les calculs matriciels et la fonction MALA sont les mêmes en dimensions
+1 et 2. Le changement de dimension intervient principalement dans la
+construction de `locs`, dans les graphiques et dans les noms des
+fichiers de sortie.
+
+# Création des sites et simulation des données
+
+## Fonction `createLocs()`
+
+Les sites spatiaux sont générés avec la fonction `createLocs()`. La
+graine aléatoire est fixée avant son appel. Ainsi, dans l'expérience
+factorielle, chaque valeur de `seed` produit une nouvelle configuration
+spatiale, en plus d'une nouvelle réalisation du champ latent et du bruit
+d'observation.
+
+En dimension 1, les sites sont générés sur l'intervalle (\[0,1\]), puis
+triés. Une seconde coordonnée constante est ajoutée pour conserver le
+format attendu par `GpGp`. En dimension 2, les deux coordonnées sont
+générées indépendamment sur (\[0,1\]).
+
+```{r}
+createLocs <- function(dimension, n) {
+  if (dimension == 1) {
+    locs = cbind(sort(runif(n)), 1)
+  }
+  if (dimension == 2) {
+    locs = cbind(runif(n), runif(n))
+  }
+  return(locs)
+}
+```
+
+## Paramètres généraux
+
+Le document doit être exécuté séparément avec `dimension = 1`, puis avec
+`dimension = 2`.
+
+```{r}
+library(Matrix)
+library(GpGp)
+library(coda)
+library(ggplot2)
+
+#dimension = 1
+dimension = 2
+
+seed = 123
+set.seed(seed)
+
+#### Paramètres MCMC ####
+n_iter = 10000
+burn_in = 2000
+rho = 0.9
+
+#### Paramètres du modèle spatial ####
+n = 1000
+nb_nn = 6
+nu = 1.5
+range = 0.02
+tau2 = rep(5, n)
+```
+
+## Simulation du champ latent et des observations
+
+```{r}
+locs = createLocs(dimension = dimension, n = n)
+
+X = cbind(1, rnorm(nrow(locs)))
+beta = c(1, 0.01)
+
+NNarray = GpGp::find_ordered_nn(locs, nb_nn)
+
+Linv = GpGp::vecchia_Linv(
+  c(1, range / nu, nu, 0.0001),
+  "matern_isotropic",
+  locs,
+  NNarray
+)
+
+R_tilde = Matrix::sparseMatrix(
+  i = row(NNarray)[!is.na(NNarray)],
+  j = NNarray[!is.na(NNarray)],
+  x = Linv[!is.na(NNarray)],
+  triangular = TRUE
+)
+
+w = as.vector(solve(R_tilde, rnorm(nrow(R_tilde))))
+
+epsilon = sqrt(tau2) * rnorm(nrow(locs))
+y = as.vector(X %*% beta + w + epsilon)
+```
+
+# Vérification de la solution analytique
+
+Avant d'étudier les performances de MALA, je vérifie que la distribution
+postérieure du champ latent est correctement caractérisée. Cette étape
+est essentielle, car le modèle gaussien possède une solution analytique
+qui servira de référence pour contrôler les estimations MCMC.
+
+Le modèle est
+
+$$ y=X\beta+w+\varepsilon, \qquad \varepsilon\sim\mathcal N(0,\tau^2I), $$
+
+et le champ latent possède la précision a priori
+
+$$ Q_0=R^\top R. $$
+
+Comme la vraisemblance et la loi a priori sont gaussiennes, la loi
+conditionnelle de $w\mid y$ reste gaussienne. Sa précision est
+
+$$ Q_{\mathrm{post}}=Q_0+\tau^{-2}I, $$
+
+et sa moyenne est la solution de
+
+$$ Q_{\mathrm{post}}\mu_{\mathrm{post}} =\tau^{-2}(y-X\beta). $$
+
+La solution analytique permet ensuite de vérifier si les moyennes et les
+écarts-types obtenus par MALA sont corrects.
+
+## Fonction analytique
+
+```{r}
+fct_analytique <- function(R_tilde, tau2, X, beta, y) {
+
+  prior_precision = crossprod(R_tilde)
+  posterior_precision = prior_precision
+  diag(posterior_precision) = diag(posterior_precision) + 1 / tau2
+  posterior_precision_chol = Matrix::expand(
+    Matrix::Cholesky(posterior_precision,LDL = FALSE, perm = TRUE, super = FALSE)
+  )
+
+  rhs = as.vector((y - X %*% beta) / tau2)
+  mean_w_knowing_y =
+    t(posterior_precision_chol$P) %*% Matrix::solve(t(posterior_precision_chol$L),
+      Matrix::solve(posterior_precision_chol$L, posterior_precision_chol$P %*% rhs)
+    )
+  
+  variance_analytique = diag(Matrix::solve(posterior_precision))
+  sd_analytique = sqrt(variance_analytique)
+  
+  list(
+    y = y,
+    esp_w = as.vector(mean_w_knowing_y),
+    variance_w_analytic = variance_analytique,
+    sd_w_analytic = sd_analytique
+  )
+}
+```
+
+## Validation du calcul par Cholesky
+
+Pour valider la fonction la décomposition de Cholesky, plus rapide, je
+fait une vérification utilisant la matrice de précision. Ces valeurs
+sont extrêmements proche de zéro et correspond uniquement aux erreurs
+d’arrondi numériques. Alors fonction analytique est donc correctement
+validée, aussi bien par comparaison avec solve() que par substitution
+dans l’équation linéaire. La moyenne obtenue avec la factorisation de
+Cholesky est comparée à celle obtenue directement avec `solve()`. Je
+vérifie également qu'elle satisfait le système linéaire associé.
+
+```{r}
+Q0 = Matrix::crossprod(R_tilde)
+Qpost = Q0 + Matrix::Diagonal( n = nrow(Q0), x = 1 / tau2)
+
+rhs = as.vector((y - X %*% beta) / tau2)
+mu1 = as.vector( solve(Qpost, rhs))
+
+res_analytique = fct_analytique(R_tilde, tau2, X, beta, y)
+mu2 = as.vector(res_analytique$esp_w)
+
+data.frame(test = c("Comparaison avec solve","Résidu du système" ),
+  erreur_max = c( max(abs(mu1 - mu2)), max(abs(Qpost %*% mu2 - rhs)))
+)
+```
+
+# Vérification des matrices de conditionnement
+
+## Construction et factorisation
+
+```{r}
+conditioning_identity = Matrix::Diagonal(nrow(R_tilde))
+conditioning_prior = Q0
+conditioning_posterior = Qpost
+```
+
+```{r}
+chol_identity = Matrix::expand(Matrix::Cholesky(conditioning_identity,LDL=FALSE,perm =TRUE
+                                                ,super=FALSE))
+chol_prior = Matrix::expand(Matrix::Cholesky(conditioning_prior,LDL = FALSE,perm = TRUE
+                                             ,super = FALSE))
+chol_posterior = Matrix::expand(Matrix::Cholesky(conditioning_posterior,LDL=FALSE,perm = 
+                                                   TRUE,super = FALSE))
+```
+
+## Test de `solveCond()` et `solveCholCond()`
+
+La fonction MALA n'utilise pas explicitement l'inverse de la matrice de
+conditionnement (C). Elle exploite sa factorisation de Cholesky, ce qui
+est plus rapide et plus stable numériquement.
+
+Deux opérations sont donc testées. La première est la résolution
+
+$$ x=C^{-1}v. $$
+
+La valeur produite par `solveCond(v)` est comparée à celle obtenue
+directement avec `Matrix::solve(C, v)`. Je vérifie aussi que la solution
+satisfait bien (Cx=v).
+
+La seconde opération est la génération du momentum. La fonction
+`solveCholCond()` doit produire
+
+$$ p\sim\mathcal N(0,C). $$
+
+Le test ci-dessous contrôle d'abord l'identité algébrique liée à
+`solveCond()`. La section suivante vérifie empiriquement la covariance
+des vecteurs simulés par `solveCholCond()`. Ces tests sont répétés pour
+les trois conditionnements.
+
+```{r}
+test_conditioning <- function(conditioning_mat, conditioning_chol) {
+
+  n = nrow(conditioning_mat)
+  P = conditioning_chol$P
+  L = conditioning_chol$L
+
+  if (is.null(P)) {
+    P = Matrix::Diagonal(n)
+  }
+
+  solveCond = function(v) {
+    as.vector(t(P) %*%Matrix::solve(t(L), Matrix::solve(L, P %*% v)))
+  }
+
+  solveCholCond = function() {
+    as.vector(t(P) %*% L %*% rnorm(n))
+  }
+
+  set.seed(1)
+  v = rnorm(n)
+  solution_chol = solveCond(v)
+  solution_directe = as.vector( Matrix::solve(conditioning_mat, v))
+  erreur_solve = max(abs(solution_chol - solution_directe))
+  erreur_systeme = max(abs(as.vector(conditioning_mat %*% solution_chol) - v))
+  p = solveCholCond()
+
+  list(
+    erreur_solve = erreur_solve,
+    erreur_systeme = erreur_systeme,
+    norme_p = sqrt(sum(p^2)),
+    solveCond = solveCond,
+    solveCholCond = solveCholCond
+  )
+}
+```
+
+```{r}
+test_identity = test_conditioning(conditioning_identity, chol_identity)
+test_prior = test_conditioning(conditioning_prior,chol_prior)
+test_posterior = test_conditioning(conditioning_posterior, chol_posterior)
+
+resultat_conditioning = data.frame(
+  conditioning = c(
+    "identity",
+    "prior",
+    "posterior"
+  ),
+  erreur_solve = c(
+    test_identity$erreur_solve,
+    test_prior$erreur_solve,
+    test_posterior$erreur_solve
+  ),
+  erreur_systeme = c(
+    test_identity$erreur_systeme,
+    test_prior$erreur_systeme,
+    test_posterior$erreur_systeme
+  )
+)
+
+resultat_conditioning
+```
+
+Les erreurs doivent être proches de la précision machine. Cela vérifie
+que les trois matrices et leurs factorisations sont correctement
+utilisées.
+
+## Vérification empirique de `solveCholCond()`
+
+```{r}
+verification_solveCholCond <- function(
+    conditioning_chol,
+    n_sim = 10000
+) {
+
+  P = conditioning_chol$P
+  L = conditioning_chol$L
+  n = nrow(L)
+  if (is.null(P)) {
+    P = Matrix::Diagonal(n)
+  }
+
+  simulations = matrix(NA_real_, nrow = n_sim, ncol = min(10, n))
+  for (i in seq_len(n_sim)) {
+    p = as.vector(t(P) %*% L %*% rnorm(n))
+    simulations[i, ] = p[1:min(10, n)]
+  }
+  apply(simulations, 2, var)
+}
+```
+
+```{r}
+var_identity = verification_solveCholCond(chol_identity)
+var_prior = verification_solveCholCond(chol_prior)
+var_posterior = verification_solveCholCond(chol_posterior)
+
+diag_identity = rep(1, 10)
+diag_prior = diag(conditioning_prior)[1:10]
+diag_posterior = diag(conditioning_posterior)[1:10]
+
+resultat_variances = data.frame(
+  conditioning = c(
+    "identity",
+    "prior",
+    "posterior"
+  ),
+  erreur_relative_moyenne = c(
+    mean(abs(var_identity - diag_identity) / diag_identity),
+    mean(abs(var_prior - diag_prior) / diag_prior),
+    mean(abs(var_posterior - diag_posterior) / diag_posterior)
+  ),
+  erreur_relative_max = c(
+    max(abs(var_identity - diag_identity) / diag_identity),
+    max(abs(var_prior - diag_prior) / diag_prior),
+    max(abs(var_posterior - diag_posterior) / diag_posterior)
+  )
+)
+
+resultat_variances
+```
+
+Les variances empiriques obtenues à partir de 10 000 simulations sont
+très proches des variances théoriques données par la diagonale de la
+matrice de conditionnement. Les erreurs relatives moyennes sont de
+l’ordre de 1 %, et les erreurs maximales restent inférieures à 2.3 %.
+Ces écarts sont compatibles avec l’erreur Monte Carlo due au nombre fini
+de simulations. On peut donc considérer que la fonction
+`solveCholCond()` génère correctement des vecteurs suivant une loi
+gaussienne centrée de covariance C. Fonction MALA avec
+préconditionnement et momentum
+
+# Algorithme MALA préconditionné avec momentum
+
+La fonction `mala_precond_momentum()` constitue le cœur de l'étude. Elle
+génère une chaîne de Markov ayant pour distribution stationnaire la loi
+postérieure de $w\mid y$. L'algorithme combine le gradient de la
+log-densité postérieure, une matrice de conditionnement, un momentum
+auxiliaire et un rafraîchissement partiel de ce momentum.
+
+## Entrées de la fonction
+
+Les principaux arguments sont `R_tilde`, `tau2`, `X`, `beta` et `y` pour
+le modèle, `n_iter` et `burn_in` pour la simulation, `rho` pour la
+persistance du momentum et `conditioningChol` pour la factorisation de
+la matrice de conditionnement.
+
+## Densité cible et gradient
+
+À une constante près,
+
+$$ \log\pi(w) =-\frac12\|Rw\|^2 -\frac12\sum_{i=1}^n \frac{(y_i-x_i^\top\beta-w_i)^2}{\tau_i^2}, $$
+
+avec gradient
+
+$$ \nabla\log\pi(w) =-R^\top Rw+\frac{y-X\beta-w}{\tau^2}. $$
+
+## Conditionnement et énergie cinétique
+
+La matrice (C) définit la covariance du momentum,
+$p\sim\mathcal N(0,C)$, et l'énergie cinétique
+
+$$ K(p)=\frac12p^\top C^{-1}p. $$
+
+Le conditionnement adapte ainsi l'échelle et les directions des
+déplacements.
+
+## Rafraîchissement du momentum
+
+Le momentum est partiellement renouvelé selon
+
+$$ p_{\mathrm{ref}}=\rho p+\sqrt{1-\rho^2},\xi, \qquad \xi\sim\mathcal N(0,C). $$
+
+Pour $\rho=0$, il est entièrement renouvelé. Pour une valeur proche de
+1, une grande partie du momentum précédent est conservée.
+
+## Proposition leapfrog et acceptation
+
+Un pas de leapfrog est réalisé :
+
+$$ p_{1/2}=p_{\mathrm{ref}}+\frac{\varepsilon}{2}\nabla\log\pi(w), $$
+
+$$ w^\star=w+\varepsilon C^{-1}p_{1/2}, $$
+
+$$ p\star=p_{1/2}+\frac{\varepsilon}{2}\nabla\log\pi(w\star). $$
+
+La proposition est ensuite acceptée ou rejetée avec une correction de
+Metropolis-Hastings fondée sur l'énergie hamiltonienne
+$H(w,p)=-\log\pi(w)+K(p)$.
+
+## Adaptation du pas et sorties
+
+Pendant le burn-in, le logarithme du pas est adapté pour viser un taux
+d'acceptation de 0.574. Après le burn_in, le pas reste fixe. La fonction
+retourne les échantillons, les taux d'acceptation, l'historique du pas,
+les moyennes et écarts-types postérieurs ainsi que plusieurs résumés de
+l'ESS.
+
+## Implémentation complète
+
+```{r}
+fct_mala_precond_momentum <- function( R_tilde, tau2, X, beta,  y, n_iter, 
+                                       burn_in,rho, conditioning_mat) {
+
+  s = 1
+  n = length(y)
+  target_accept = 0.574
+  P = conditioning_mat$P
+  L = conditioning_mat$L
+
+  if (is.null(P)) {
+    P = Matrix::Diagonal(nrow(L))
+  }
+
+  # Calcul de C^{-1}v
+  solveCond = function(v) {
+    as.vector(Matrix::crossprod( P, Matrix::solve(Matrix::t(L), Matrix::solve(L,P %*% v))))
+  }
+
+  # Simulation suivant N(0,C)
+  solveCholCond = function() {
+    z = rnorm(n)
+    as.vector(Matrix::crossprod(P,L %*% z))
+  }
+  xb = as.vector(X %*% beta)
+  logpi = function(w) {
+    r = y - xb - w
+
+    -0.5 * sum((R_tilde %*% w)^2) -
+      0.5 * sum(r^2 / tau2)
+  }
+
+  grad = function(w) {
+    as.vector(-Matrix::crossprod(R_tilde, R_tilde %*% w) + (y - xb - w) / tau2 )
+  }
+
+  kinetic = function(p) {
+    0.5 * as.numeric(Matrix::crossprod( p, solveCond(p)))
+  }
+
+  H = function(w, p) {
+    -logpi(w) + kinetic(p)
+  }
+
+  w = rep(0, n)
+  p = solveCholCond()
+  w_chain = matrix(NA_real_, nrow = n_iter, ncol = n)
+  p_chain = matrix( NA_real_, nrow = n_iter, ncol = n)
+
+  accept = integer(n_iter)
+  pas = numeric(n_iter)
+  log_s = log(s)
+
+  for (i in seq_len(n_iter)) {
+    eps = exp(log_s)
+    accepte = 0L
+    p_ref = rho * p + sqrt(1 - rho^2) * solveCholCond()
+    p_half = p_ref + (eps / 2) * grad(w)
+    w_prop = w + eps * solveCond(p_half)
+    p_prop = p_half + (eps / 2) * grad(w_prop)
+    log_alpha = -H(w_prop, p_prop) + H(w, p_ref)
+
+    log_acc = if (is.finite(log_alpha)) {
+      min(0, log_alpha)
+    } else {
+      -Inf
+    }
+
+    if (log(runif(1)) < log_acc) {
+      w = w_prop
+      p = p_prop
+      accepte = 1L
+    } else {
+      p = -p_ref
+    }
+
+    if (i <= burn_in) {
+      gamma = 1 / (i + 10)^0.6
+      log_s = log_s + gamma * (accepte - target_accept)
+      log_s = max( log(1e-6), min(log_s, log(10)))
+    }
+
+    w_chain[i, ] = w
+    p_chain[i, ] = p
+    accept[i] = accepte
+    pas[i] = exp(log_s)
+  }
+
+  ind = (burn_in + 1):n_iter
+  post = w_chain[ind, , drop = FALSE]
+  moy = colMeans(post)
+  variance = apply(post, 2, var)
+  ecart_type = apply(post, 2, sd)
+  ess = as.numeric(coda::effectiveSize(coda::as.mcmc(post)))
+
+  list(
+    mean_w = moy,
+    variance_w = variance,
+    sd_w = ecart_type,
+    ess_mean = round(mean(ess, na.rm = TRUE), 2),
+    ess_median = round(median(ess, na.rm = TRUE), 2),
+    ess_min = round(min(ess, na.rm = TRUE), 2),
+    ess_max = round(max(ess, na.rm = TRUE), 2),
+    samples = w_chain,
+    p_samples = p_chain,
+    accept_history = accept,
+    accept_rate = mean(accept),
+    accept_rate_post = mean(accept[ind]),
+    s_history = pas,
+    final_step = exp(log_s)
+  )
+}
+```
+
+# Test du bon fonctionnement des trois conditionnements
+
+Après avoir vérifié séparément les opérations matricielles, je teste
+maintenant l'algorithme MALA complet avec les trois conditionnements.
+L'objectif est de vérifier que les chaînes sont finies, non bloquées et
+compatibles avec la solution analytique. Il ne s'agit pas encore de
+déterminer définitivement quel conditionnement est le meilleur.
+
+Pour rendre ce test plus contrôlé, la même réalisation des données et la
+même graine MCMC sont utilisées pour les trois appels.
+
+```{r}
+set.seed(123)
+
+MCMC_identity = fct_mala_precond_momentum(
+  R_tilde = R_tilde,
+  tau2 = tau2,
+  X = X,
+  beta = beta,
+  y = y,
+  n_iter = n_iter,
+  burn_in = burn_in,
+  rho = rho,
+  conditioning_mat = chol_identity
+)
+
+set.seed(123)
+
+MCMC_prior = fct_mala_precond_momentum(
+  R_tilde = R_tilde,
+  tau2 = tau2,
+  X = X,
+  beta = beta,
+  y = y,
+  n_iter = n_iter,
+  burn_in = burn_in,
+  rho = rho,
+  conditioning_mat = chol_prior
+)
+
+set.seed(123)
+
+MCMC_posterior = fct_mala_precond_momentum(
+  R_tilde = R_tilde,
+  tau2 = tau2,
+  X = X,
+  beta = beta,
+  y = y,
+  n_iter = n_iter,
+  burn_in = burn_in,
+  rho = rho,
+  conditioning_mat = chol_posterior
+)
+```
+
+## Vérifications numériques des chaînes
+
+Une chaîne est considérée comme numériquement fonctionnelle si elle ne
+contient pas de valeur non finie, si la variance empirique de sa
+première composante est positive et si cette composante prend un grand
+nombre de valeurs distinctes. Ces contrôles détectent une chaîne bloquée
+ou une instabilité évidente, mais ne constituent pas à eux seuls une
+preuve de convergence.
+
+```{r}
+chainChecks = data.frame(
+  conditioning = c("identity", "prior", "posterior"),
+  finite = c(
+    all(is.finite(MCMC_identity$samples)),
+    all(is.finite(MCMC_prior$samples)),
+    all(is.finite(MCMC_posterior$samples))
+  ),
+  sdFirstComponent = c(
+    sd(MCMC_identity$samples[, 1]),
+    sd(MCMC_prior$samples[, 1]),
+    sd(MCMC_posterior$samples[, 1])
+  ),
+  distinctValues = c(
+    length(unique(MCMC_identity$samples[, 1])),
+    length(unique(MCMC_prior$samples[, 1])),
+    length(unique(MCMC_posterior$samples[, 1]))
+  )
+)
+
+chainChecks
+```
+
+## Tableau de synthèse
+
+```{r}
+resultat_mala = data.frame(
+  conditioning = c(
+    "identity",
+    "prior",
+    "posterior"
+  ),
+
+  accept_rate = c(
+    MCMC_identity$accept_rate,
+    MCMC_prior$accept_rate,
+    MCMC_posterior$accept_rate
+  ),
+
+  accept_rate_post = c(
+    MCMC_identity$accept_rate_post,
+    MCMC_prior$accept_rate_post,
+    MCMC_posterior$accept_rate_post
+  ),
+
+  final_step = c(
+    MCMC_identity$final_step,
+    MCMC_prior$final_step,
+    MCMC_posterior$final_step
+  ),
+
+  ess_mean = c(
+    MCMC_identity$ess_mean,
+    MCMC_prior$ess_mean,
+    MCMC_posterior$ess_mean
+  ),
+
+  ess_median = c(
+    MCMC_identity$ess_median,
+    MCMC_prior$ess_median,
+    MCMC_posterior$ess_median
+  ),
+
+  ess_min = c(
+    MCMC_identity$ess_min,
+    MCMC_prior$ess_min,
+    MCMC_posterior$ess_min
+  ),
+
+  ess_max = c(
+    MCMC_identity$ess_max,
+    MCMC_prior$ess_max,
+    MCMC_posterior$ess_max
+  ),
+
+  finite_chain = c(
+    all(is.finite(MCMC_identity$samples)),
+    all(is.finite(MCMC_prior$samples)),
+    all(is.finite(MCMC_posterior$samples))
+  )
+)
+
+resultat_mala
+```
+
+La comparaison actuelle reste informative avec 10000 simulations, mais
+les chaînes pourraient probablement produire de meilleurs ESS avec une
+adaptation plus longue.
+
+Pour cette configuration : prior \> posterior \> identity
+
+## Comparaison avec la solution analytique
+
+```{r}
+mu_analytique = as.vector(res_analytique$esp_w)
+
+resultat_mala$rmse_mean = c(
+  sqrt(mean((MCMC_identity$mean_w - mu_analytique)^2)),
+  sqrt(mean((MCMC_prior$mean_w - mu_analytique)^2)),
+  sqrt(mean((MCMC_posterior$mean_w - mu_analytique)^2))
+)
+
+resultat_mala$rmse_sd = c(
+  sqrt(mean((MCMC_identity$sd_w - res_analytique$sd_w_analytic)^2)),
+  sqrt(mean((MCMC_prior$sd_w - res_analytique$sd_w_analytic)^2)),
+  sqrt(mean((MCMC_posterior$sd_w - res_analytique$sd_w_analytic)^2))
+)
+
+resultat_mala
+```
+
+Le conditionnement par la précision a priori donne la plus petite
+erreur. Il est donc, pour cette simulation, l’estimation de la moyenne
+postérieure la plus proche de la solution analytique. Le conditionnement
+posterior donne également une bonne approximation, tandis que le
+conditionnement identité présente une erreur nettement plus élevée.
+
+Le conditionnement prior donne la meilleure ess(mean, median, min, max)
+et donne à nouveau la meilleure approximation des écarts-types
+postérieurs.
+
+```{r}
+variance_analytique <- res_analytique$variance_w_analytic
+
+rmse_variance <- c(
+  sqrt(mean(
+    (MCMC_identity$variance_w - variance_analytique)^2
+  )),
+  sqrt(mean(
+    (MCMC_prior$variance_w - variance_analytique)^2
+  )),
+  sqrt(mean(
+    (MCMC_posterior$variance_w - variance_analytique)^2
+  ))
+)
+```
+
+# Visualisations
+
+```{r}
+liste_MCMC = list(
+  identity = MCMC_identity,
+  prior = MCMC_prior,
+  posterior = MCMC_posterior
+)
+```
+
+## Graphiques en dimension 1
+
+```{r}
+plot_resultats_mcmc_1D <- function( MCMC, nom_conditioning
+) {
+
+  ord = order(locs[, 1])
+  x = locs[ord, 1]
+
+  col_mcmc = c(
+    identity = "darkorange",
+    prior = "royalblue",
+    posterior = "forestgreen"
+  )[nom_conditioning]
+
+  moyenne = MCMC$mean_w[ord]
+  sd = MCMC$sd_w[ord]
+
+  borne_inf = moyenne - 1.96 * sd
+  borne_sup = moyenne + 1.96 * sd
+  par(mfrow = c(1,1))
+
+  plot(MCMC$s_history, type = "l", col = col_mcmc,
+    lwd = 2, main = paste( "Évolution du pas -", nom_conditioning ),
+    xlab = "Itération",
+    ylab = "s"
+  )
+
+  plot( x, w[ord], type = "n", ylim = range(w, borne_inf, borne_sup),
+    xlab = "Position spatiale",
+    ylab = "Valeur", main = paste( "Champ latent -", nom_conditioning)
+  )
+
+  polygon( c(x, rev(x)), c(borne_inf, rev(borne_sup)),
+    col = adjustcolor(col_mcmc, alpha.f = 0.2), border = NA )
+
+  lines( x, w[ord], col = "black", lwd = 2)
+  lines(x, moyenne, col = col_mcmc, lwd = 2, lty = 2)
+  legend("topright",
+    c( "Champ latent",
+      "Moyenne MCMC",
+      "Intervalle 95 %"
+    ),
+    col = c( "black", col_mcmc,  adjustcolor(col_mcmc, 0.2) ),
+    lty = c(1, 2, NA),
+    lwd = c(2, 2, NA),
+    pch = c(NA, NA, 15),
+    bty = "n"
+  )
+
+  plot( res_analytique$esp_w, MCMC$mean_w, pch = 16,
+    col = col_mcmc,main = paste("Moyennes -", nom_conditioning),
+    xlab = "Moyenne analytique",
+    ylab = "Moyenne MCMC"
+  )
+
+  abline( 0, 1, col = "red", lty = 2, lwd = 2 )
+
+  plot(
+    res_analytique$sd_w_analytic,
+    MCMC$sd_w,
+    pch = 16,
+    col = col_mcmc,
+    main = paste(
+      "Écarts-types -",
+      nom_conditioning
+    ),
+    xlab = "Écart-type analytique",
+    ylab = "Écart-type MCMC"
+  )
+  abline( 0, 1, col = "red", lty = 2,  lwd = 2 )
+  par(mfrow = c(1, 1))
+}
+```
+
+## Graphiques en dimension 2
+
+```{r}
+plot_resultats_mcmc_2D <- function(
+    MCMC,
+    nom_conditioning
+) {
+
+  col_mcmc = c(
+    identity = "darkorange",
+    prior = "royalblue",
+    posterior = "forestgreen"
+  )[nom_conditioning]
+
+  
+  par(mfrow = c(1, 1))
+
+  plot(MCMC$s_history, type = "l", col = col_mcmc, lwd = 2,
+    main = paste( "Évolution du pas -", nom_conditioning ),
+    xlab = "Itération",
+    ylab = "s"
+  )
+
+  GeoNonStat::plotPointillistPainting( locs,  w, cex = 20, 
+                                       main = "Champ latent simulé")
+  GeoNonStat::plotPointillistPainting( locs, MCMC$mean_w, cex = 20, 
+                                       main = paste("Moyenne MCMC -", nom_conditioning)
+  )
+
+  par(mfrow = c(1, 1))
+}
+```
+
+```{r}
+if (dimension == 1) {
+  for (nom_conditioning in names(liste_MCMC)) {
+    plot_resultats_mcmc_1D(
+      liste_MCMC[[nom_conditioning]],
+      nom_conditioning
+    )
+  }
+}
+
+if (dimension == 2) {
+  for (nom_conditioning in names(liste_MCMC)) {
+    plot_resultats_mcmc_2D(
+      liste_MCMC[[nom_conditioning]],
+      nom_conditioning
+    )
+  }
+}
+```
+
+# Fonction allégée pour l'expérience factorielle
+
+La fonction suivante stocke uniquement les tirages après le burn-in.
+Elle utilise moins de mémoire que la fonction précédente.
+
+```{r}
+fct_mala_precond_momentum_modified <- function(R_tilde, tau2, X, beta,y, n_iter,
+                                               burn_in, rho,conditioning_mat) {
+
+  s = 1
+  n = length(y)
+  target_accept = 0.574
+  P = conditioning_mat$P
+  L = conditioning_mat$L
+  if (is.null(P)) {
+    P = Matrix::Diagonal(nrow(L))
+  }
+
+  solveCond = function(v) {
+    as.vector(Matrix::crossprod(P, 
+                                Matrix::solve(Matrix::t(L), Matrix::solve(L, P %*% v))))
+  }
+
+  solveCholCond = function() {
+    z = rnorm(n)
+    as.vector(Matrix::crossprod(P, L %*% z ))
+  }
+
+  xb = as.vector(X %*% beta)
+  logpi = function(w) {
+    r = y - xb - w
+
+    -0.5 * sum((R_tilde %*% w)^2) -
+      0.5 * sum(r^2 / tau2)
+  }
+
+  grad = function(w) {
+    as.vector(-Matrix::crossprod(R_tilde, R_tilde %*% w) + (y - xb - w) / tau2)
+  }
+
+  kinetic = function(p) {
+    0.5 * as.numeric(Matrix::crossprod( p, solveCond(p)))
+  }
+
+  H = function(w, p) {
+    -logpi(w) + kinetic(p)
+  }
+  w = rep(0, n)
+  p = solveCholCond()
+  post = matrix(NA_real_, nrow = n_iter - burn_in, ncol = n)
+  accept = integer(n_iter)
+  pas = numeric(n_iter)
+  log_s = log(s)
+
+  for (i in seq_len(n_iter)) {
+    eps = exp(log_s)
+    accepte = 0L
+    p_ref = rho * p + sqrt(1 - rho^2) * solveCholCond()
+    p_half = p_ref + (eps / 2) * grad(w)
+    w_prop = w + eps * solveCond(p_half)
+    p_prop = p_half + (eps / 2) * grad(w_prop)
+
+    log_alpha = -H(w_prop, p_prop) + H(w, p_ref)
+
+    log_acc = if (is.finite(log_alpha)) {
+      min(0, log_alpha)
+    } else {
+      -Inf
+    }
+
+    if (log(runif(1)) < log_acc) {
+      w = w_prop
+      p = p_prop
+      accepte = 1L
+    } else {
+      p = -p_ref
+    }
+
+    if (i <= burn_in) {
+      gamma = 1 / (i + 10)^0.6
+      log_s = log_s + gamma * (accepte - target_accept)
+      log_s = max(log(1e-6), min(log_s, log(10)) )
+    }
+    accept[i] = accepte
+    pas[i] = exp(log_s)
+
+    if (i > burn_in) {
+      post[i - burn_in, ] = w
+    }
+  }
+
+  moy = colMeans(post)
+  ecart_type = apply(post, 2, sd)
+  ess = as.numeric(coda::effectiveSize(coda::as.mcmc(post) ))
+  ind = (burn_in + 1):n_iter
+
+  list(
+    mean_w = moy,
+    sd_w = ecart_type,
+    ess_mean = round(mean(ess, na.rm = TRUE), 2),
+    ess_median = round(median(ess, na.rm = TRUE), 2),
+    ess_min = round(min(ess, na.rm = TRUE), 2),
+    ess_max = round(max(ess, na.rm = TRUE), 2),
+    accept_history = accept,
+    accept_rate = mean(accept),
+    accept_rate_post = mean(accept[ind]),
+    s_history = pas,
+    final_step = exp(log_s)
+  )
+}
+```
+
+# Expérience factorielle parallèle
+
+## Grille de paramètres
+
+```{r}
+experiment_parameters = as.matrix(
+  expand.grid(
+    nu = c(0.5, 1.5),
+    tau2 = c(0.1, 1, 5),
+    range = c(0.02, 0.05),
+    rho = c(0, 0.5, 0.9),
+    conditioning = c(0, 1, 2),
+    seed = seq(5)
+  )
+)
+```
+
+## Exécution parallèle
+
+```{r}
+cl = parallel::makeCluster( max( 1, floor(parallel::detectCores() * 0.5) ))
+parallel::clusterExport(cl, 
+  varlist = c("experiment_parameters",
+              "burn_in",
+              "n_iter",
+              "dimension",
+              "n",
+              "nb_nn",
+              "createLocs",
+              "fct_mala_precond_momentum_modified"),
+  envir = .GlobalEnv
+)
+
+experiment_results = parallel::parLapply(cl = cl, X = split(experiment_parameters, row(experiment_parameters)),
+  fun = function(params) {
+      names(params) = colnames(experiment_parameters)
+      sigma2 = as.numeric(params["sigma2"])
+      nu = as.numeric(params["nu"])
+      range = as.numeric(params["range"])
+      rho = as.numeric(params["rho"])
+      conditioning = as.integer(params["conditioning"])
+      seed = as.integer(params["seed"])
+      set.seed(seed)
+      locs = createLocs(dimension, n)
+      X = cbind(1, rnorm(n) )
+      NNarray = GpGp::find_ordered_nn( locs, nb_nn )
+      beta = c(1, 0.01)
+      Linv = GpGp::vecchia_Linv(
+        c( 1,  range / sqrt(nu) ,  nu,  0.0001 ),
+        "matern_isotropic", locs,  NNarray )
+      
+      R_tilde = Matrix::sparseMatrix(
+        i = row(NNarray)[!is.na(NNarray)],
+        j = NNarray[!is.na(NNarray)],
+        x = Linv[!is.na(NNarray)],
+        triangular = TRUE
+      )
+      
+      w = as.vector( solve(R_tilde, rnorm(nrow(R_tilde))) )
+      y = as.vector( X %*% beta + w + sqrt(params["tau2"]) *rnorm(nrow(locs)))
+
+      
+    if (params["conditioning"] == 0) {
+      conditioning_mat = Matrix::Diagonal(nrow(R_tilde))
+    }
+
+    if (params["conditioning"] == 1) {
+      conditioning_mat = crossprod(R_tilde)
+    }
+
+    if (params["conditioning"] == 2) {
+      conditioning_mat = crossprod(R_tilde)
+      Matrix::diag(conditioning_mat) = Matrix::diag(conditioning_mat) + 1 / params["tau2"]
+    }
+    conditioning_mat = Matrix::expand(
+      Matrix::Cholesky(conditioning_mat,LDL = FALSE,perm = TRUE,super = FALSE)
+    )
+
+    MCMC = fct_mala_precond_momentum_modified(
+      y = y,
+      X = X,
+      beta = beta,
+      tau2 = params["tau2"],
+      R_tilde = R_tilde,
+      burn_in = burn_in,
+      n_iter = n_iter,
+      conditioning_mat = conditioning_mat,
+      rho = params["rho"]
+    )
+
+    experiment_dir = file.path(paste0("Gaussian_experiment_results_dim", dimension),
+      paste0(
+        "seed_", params["seed"],
+        "_nu_", params["nu"],
+        "_tau2_", params["tau2"],
+        "_range_", params["range"],
+        "_rho_", params["rho"],
+        "_conditioning_", params["conditioning"]
+      )
+    )
+
+    dir.create(experiment_dir, recursive = TRUE,  showWarnings = FALSE)
+
+    if (dimension == 1) {
+      
+      ord = order(locs[, 1])
+      x = locs[ord, 1]
+      y_plot = as.vector(y)[ord]
+      w_plot = w[ord]
+      mean_w_plot = as.vector(MCMC$mean_w)[ord]
+      
+      png(filename = file.path( experiment_dir,"observed.png"))
+      plot(x,y_plot,pch = 16, cex = 0.5, xlab = "Position spatiale",
+        ylab = "Valeur observée", main = "Données observées" )
+      dev.off()
+
+      png(filename = file.path( experiment_dir, "latent.png" ))
+      plot( x, w_plot, type = "l", lwd = 2, xlab = "Position spatiale", 
+            ylab = "Champ latent", main = "Champ latent simulé")
+      dev.off()
+
+      png( filename = file.path(experiment_dir, "estimated_mean.png" ) )
+      plot(x, mean_w_plot, type = "l", lwd = 2, xlab = "Position spatiale",
+           ylab = "Moyenne estimée", main = "Moyenne postérieure estimée")
+      dev.off()
+    }
+
+    if (dimension == 2) {
+      
+      png( filename = file.path( experiment_dir,  "observed.png" ) )
+      GeoNonStat::plotPointillistPainting(locs, y, cex = 20 )
+      dev.off()
+      
+      png(filename = file.path(experiment_dir, "latent.png"))
+      GeoNonStat::plotPointillistPainting(locs, w, cex = 20)
+      dev.off()
+
+      png(filename = file.path(experiment_dir, "estimated_mean.png"))
+      GeoNonStat::plotPointillistPainting(locs, MCMC$mean_w, cex = 20)
+      dev.off()
+    }
+
+    c(
+      nu = nu,
+      tau2 = as.numeric(params["tau2"]),
+      range = range,
+      rho = rho,
+      conditioning = conditioning,
+      seed = seed,
+      accept_rate = MCMC$accept_rate,
+      accept_rate_post = MCMC$accept_rate_post,
+      final_step = MCMC$final_step,
+      ess_mean = MCMC$ess_mean,
+      ess_median = MCMC$ess_median,
+      ess_min = MCMC$ess_min,
+      ess_max = MCMC$ess_max
+    )
+  }
+)
+
+parallel::stopCluster(cl)
+```
+
+## Mise en forme et sauvegarde
+
+```{r}
+experiment_results = do.call(rbind, experiment_results)
+experiment_results = as.data.frame( experiment_results)
+rownames(experiment_results) = NULL
+nom_rds = paste0("experiment_gaussian_results_dim", dimension, ".rds")
+nom_csv = paste0("experiment_gaussian_results_dim", dimension, ".csv")
+
+saveRDS( experiment_results, file = nom_rds)
+write.csv( experiment_results, file = nom_csv, row.names = FALSE)
+head(experiment_results)
+```
+
+# Analyse des résultats
+
+## Modèle pour l'ESS médian
+
+L'ESS médian est retenu comme critère principal car il est moins
+sensible aux valeurs extrêmes que l'ESS moyen.
+
+```{r}
+unique(experiment_results$range)
+
+modele_ess_median = lm(
+  ess_median ~
+    factor(seed) +
+    factor(nu) +
+    factor(tau2) * factor(conditioning) +
+    factor(range) * factor(conditioning) +
+    factor(rho) * factor(conditioning),
+  data = experiment_results
+)
+
+summary(modele_ess_median)
+```
+
+Le modèle linéaire explique environ 90 % de la variabilité de l’ESS
+médian. Les résultats montrent que l’effet de la variance du bruit
+dépend fortement du conditionnement. Avec le conditionnement identité,
+l’augmentation de tau2\^2 diminue fortement l’ESS médian. À l’inverse,
+le conditionnement prior bénéficie fortement des valeurs élevées de
+tau2\^2, tandis que le conditionnement posterior reste relativement
+stable. La portée spatiale pénalise également l’identité et le prior,
+alors que son effet devient faible avec le posterior. La persistance du
+momentum améliore les performances, mais son effet dépend du
+conditionnement : le posterior atteint ses meilleures performances pour
+rho = 0.5, tandis que rho = 0.9 apporte un gain beaucoup plus limité.
+Enfin, certaines graines ont un effet significatif, ce qui s’explique
+par le fait que les sites spatiaux sont désormais régénérés pour chaque
+répétition. Le conditionnement prior fournit donc les meilleures
+performances dans certaines configurations, alors que le conditionnement
+posterior apparaît comme le plus robuste aux variations des paramètres
+du modèle.
+
+## Classement des configurations
+
+Les configurations sont comparées après moyenne sur les cinq graines.
+
+```{r}
+resultats_moyens = aggregate(
+  cbind(
+    ess_mean,
+    ess_median,
+    ess_min
+  ) ~
+    nu +
+    tau2 +
+    range +
+    rho +
+    conditioning,
+  data = experiment_results,
+  FUN = mean
+)
+
+resultats_moyens = resultats_moyens[order(-resultats_moyens$ess_median), ]
+
+head(resultats_moyens, 20)
+```
+
+Après avoir moyenné les résultats sur les cinq graines, les meilleures
+performances sont obtenues avec le conditionnement prior lorsque la
+variance du bruit est élevée, tau2\^2 = 5, et lorsque la persistance du
+momentum est fixée à rho = 0.5. La meilleure configuration atteint un
+ESS médian moyen d’environ 596. Le conditionnement posterior donne des
+ESS légèrement plus faibles, compris généralement entre 520 et 514, mais
+ses performances restent très stables pour différentes valeurs de nu, de
+tau2\^2 et de la portée. Le conditionnement prior fournit donc les
+meilleures performances maximales, tandis que le conditionnement
+posterior semble plus robuste aux variations des paramètres du modèle.
+Dans les deux cas, une persistance intermédiaire du momentum, rho = 0.5,
+apparaît comme le réglage le plus favorable.
+
+## Boxplot selon $\rho$ et le conditionnement
+
+```{r}
+experiment_results$conditioning_label = factor(
+  experiment_results$conditioning,
+  levels = c(0, 1, 2),
+  labels = c(
+    "Identity",
+    "Prior",
+    "Posterior"
+  )
+)
+
+ggplot(experiment_results, aes( x = factor(rho), y = ess_median, fill = conditioning_label ))+geom_boxplot(alpha = 0.8) + theme_bw() + labs( x = expression(rho), y = "ESS médian", 
+    fill = "Conditionnement" ) + theme( text = element_text(size = 14) )
+```
+
+Le boxplot confirme que le conditionnement identité produit les ESS
+médians les plus faibles. Le conditionnement prior peut atteindre les
+valeurs d’ESS les plus élevées, notamment pour rho = 0.5, mais il
+présente une forte variabilité selon les autres paramètres du modèle. Le
+conditionnement posterior donne des performances élevées et beaucoup
+plus homogènes, en particulier pour rho = 0.5. Il apparaît donc comme le
+conditionnement le plus robuste, tandis que le prior fournit les
+meilleures performances dans certaines configurations comme rho = 0.9.
+
+# Conclusion
+
+Ce document permet de valider les principales opérations utilisées dans
+MALA préconditionné et de comparer les trois matrices de
+conditionnement.
+
+Dans le cas gaussien, la solution analytique fournit une référence pour
+vérifier les moyennes et les écarts-types estimés par MCMC.
+
+Les expériences en dimensions 1 et 2 doivent être exécutées séparément
+en modifiant la variable `dimension`. Les calculs MCMC restent
+identiques ; seules la construction des sites spatiaux, les
+représentations graphiques et les noms des fichiers de sortie changent.

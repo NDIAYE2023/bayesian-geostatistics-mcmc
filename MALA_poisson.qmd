@@ -1,0 +1,1727 @@
+---
+title: "MALA préconditionné dans le modèle géostatistique de Poisson"
+format:
+  html:
+    number-sections: true
+    toc: true
+    toc-depth: 3
+execute:
+  warning: false
+  message: false
+editor:
+  markdown:
+    wrap: 72
+---
+
+# Modèle géostatistique de Poisson
+
+Je considère maintenant un modèle d'observations de comptage.
+Conditionnellement au champ latent spatial $w$, les observations sont
+indépendantes et suivent
+
+$$Y_i\mid w_i,\beta \sim \operatorname{Poisson}(\lambda_i),$$
+
+avec un lien logarithmique
+
+$$\log(\lambda_i)=x_i^\top\beta+w_i.$$
+
+Ainsi,
+
+$$\lambda_i=\exp(x_i^\top\beta+w_i).$$
+
+Le champ latent $w$ conserve la même structure gaussienne spatiale que
+dans les modèles précédents. La différence porte sur la loi
+d'observation : les données sont maintenant des comptages
+$0,1,2,\ldots$.
+
+Comme dans le modèle binaire, la loi a posteriori de $w$ n'est pas
+disponible sous forme analytique. MALA est donc utilisé pour
+échantillonner le champ latent. La courbure locale de la log-postérieure
+permettra de construire un préconditionnement évalué au MAP.
+
+## Conventions
+
+Deux préconditionnements sont comparés :
+
+| Code | Conditionnement | Matrice |
+|-----------------------:|:-----------------------|:-----------------------|
+| 1 | prior | $Q_0=\widetilde R^\top\widetilde R$ |
+| 2 | posterior au MAP | $Q_{\mathrm{MAP}}=Q_0+\operatorname{diag}(\lambda_{\mathrm{MAP}})$ |
+
+La matrice $Q_{\mathrm{MAP}}$ constitue une approximation locale de la
+géométrie de la loi a posteriori autour du MAP. Elle ne correspond pas à
+une précision a posteriori exacte.
+
+# Paramètres et simulation d'un jeu de données
+
+Je commence par charger les bibliothèques nécessaires. `Matrix` est
+utilisée pour les matrices creuses, `GpGp` pour l'approximation de
+Vecchia, `coda` pour le calcul de l'ESS, `ggplot2` pour les graphiques
+et `parallel` pour l'expérience factorielle.
+
+Pour la validation du code, je commence avec $n=1000$. Une fois toutes
+les étapes validées, la valeur peut être replacée à $n=10000$ pour
+l'expérience finale.
+
+```{r}
+library(Matrix)
+library(GpGp)
+library(coda)
+library(ggplot2)
+library(parallel)
+
+# dimension = 1
+dimension = 2
+
+seed = 123
+set.seed(seed)
+
+# Validation initiale
+n = 1000
+
+# Expérience finale :
+# n = 10000
+
+nb_nn = 6
+n_iter = 10000
+burn_in = 2000
+rho = 0.5
+
+sigma2 = 1
+nu = 1.5
+range = 0.2
+
+beta = c(-1, 0.01)
+```
+
+La fonction suivante génère les sites spatiaux. En dimension 1, les
+sites sont triés sur $[0,1]$. En dimension 2, ils sont générés sur
+$[0,1]^2$.
+
+```{r}
+createLocs <- function(dimension, n) {
+  if (dimension == 1) locs = cbind(sort(runif(n)), 1)
+  if (dimension == 2) locs = cbind(runif(n), runif(n))
+  return(locs)
+}
+```
+
+Pour les visualisations en dimension 2, j'utilise une fonction de base
+R. Elle représente une quantité spatiale continue à l'aide d'une palette
+de couleurs.
+
+```{r}
+plot_spatial_field <- function(locs, values, main = "") {
+  values = as.numeric(values)
+  cols = hcl.colors(100, palette = "Viridis")
+
+  if (diff(range(values, na.rm = TRUE)) == 0) {
+    ind = rep(50, length(values))
+  } else {
+    breaks = seq(min(values, na.rm = TRUE),
+                 max(values, na.rm = TRUE),
+                 length.out = 101)
+    ind = cut(values, breaks = breaks,
+              include.lowest = TRUE, labels = FALSE)
+  }
+
+  plot(locs[, 1], locs[, 2], pch = 16, cex = 1.2,
+       col = cols[ind], asp = 1,
+       xlab = "Coordonnée x", ylab = "Coordonnée y",
+       main = main)
+}
+```
+
+# Construction du modèle spatial et simulation
+
+L'approximation de Vecchia permet de construire une matrice triangulaire
+creuse $\widetilde R$ telle que
+
+$$Q_0=\widetilde R^\top\widetilde R.$$
+
+Le champ latent est simulé par
+
+$$w=\widetilde R^{-1}z,
+\qquad
+z\sim\mathcal N(0,I_n).$$
+
+Dans le plan expérimental, `range` désigne la quantité
+$\ell^\star=\ell/\sqrt{\nu}$. La covariance Matérn est donc construite
+avec `range / sqrt(nu)`.
+
+L'argument `dims = c(n,n)` est ajouté explicitement lors de la
+construction de $\widetilde R$. Cela garantit que la matrice a bien la
+dimension $n\times n$ et évite les erreurs de produits matriciels non
+conformables.
+
+```{r}
+locs = createLocs(dimension, n)
+X = cbind(1, rnorm(n))
+
+NNarray = GpGp::find_ordered_nn(locs, nb_nn)
+
+Linv = GpGp::vecchia_Linv(
+  c(sigma2, range / sqrt(nu), nu, 0.0001),
+  "matern_isotropic", locs, NNarray
+)
+
+R_tilde = Matrix::sparseMatrix(
+  i = row(NNarray)[!is.na(NNarray)],
+  j = NNarray[!is.na(NNarray)],
+  x = Linv[!is.na(NNarray)],
+  dims = c(n, n),
+  triangular = TRUE
+)
+
+w = as.vector(Matrix::solve(R_tilde, rnorm(n)))
+```
+
+Je vérifie immédiatement la cohérence des dimensions.
+
+```{r}
+dim(R_tilde)
+length(w)
+dim(X)
+```
+
+# Simulation des intensités de Poisson
+
+Le prédicteur linéaire est
+
+$$\eta_i=x_i^\top\beta+w_i.$$
+
+L'intensité de Poisson est
+
+$$\lambda_i=\exp(\eta_i).$$
+
+Contrairement au lien logit, l'exponentielle n'est pas bornée. Il est
+donc important de contrôler la distribution de $\eta$ et de $\lambda$
+avant de simuler les observations.
+
+```{r}
+eta = as.vector(X %*% beta + w)
+summary(eta)
+range(eta)
+```
+
+```{r}
+hist(eta,
+     main = "Distribution du prédicteur linéaire",
+     xlab = expression(eta))
+```
+
+Je calcule ensuite les intensités.
+
+```{r}
+lambda = exp(eta)
+
+summary(lambda)
+range(lambda)
+mean(lambda)
+median(lambda)
+max(lambda)
+```
+
+# Échantillonnage des observations de Poisson
+
+Les observations sont simulées conditionnellement aux intensités :
+
+$$Y_i\sim\operatorname{Poisson}(\lambda_i).$$
+
+```{r}
+y = rpois(n = n, lambda = lambda)
+```
+
+Je vérifie ensuite la distribution des comptages.
+
+```{r}
+summary(y)
+range(y)
+mean(y)
+var(y)
+mean(y == 0)
+max(y)
+```
+
+La moyenne conditionnelle de la moyenne empirique vaut
+
+$$\mathbb E\left(
+\frac1n\sum_{i=1}^nY_i
+\mid \lambda
+\right)
+=
+\frac1n\sum_{i=1}^n\lambda_i.$$
+
+On peut donc comparer la moyenne observée à la moyenne des intensités.
+
+```{r}
+c(
+  moyenne_intensites = mean(lambda),
+  moyenne_observee = mean(y),
+  difference = abs(mean(lambda) - mean(y))
+)
+```
+
+# Vérification répétée de l'échantillonnage de $Y$
+
+Une seule réalisation peut présenter un écart aléatoire. Je répète donc
+l'échantillonnage de $Y$ en conservant les mêmes intensités $\lambda$.
+
+La moyenne des moyennes simulées doit être proche de `mean(lambda)`.
+
+```{r}
+n_sim_y = 1000
+moyenne_y = numeric(n_sim_y)
+
+for (i in seq_len(n_sim_y)) {
+  y_sim = rpois(n = length(lambda), lambda = lambda)
+  moyenne_y[i] = mean(y_sim)
+}
+
+summary(moyenne_y)
+```
+
+```{r}
+c(
+  moyenne_des_moyennes_simulees = mean(moyenne_y),
+  moyenne_des_intensites = mean(lambda)
+)
+```
+
+# Visualisation spatiale des observations
+
+Cette section compare le champ latent, l'intensité $\lambda$ et les
+comptages observés.
+
+```{r}
+if (dimension == 1) {
+  ord = order(locs[, 1])
+  xloc = locs[ord, 1]
+
+  plot(xloc, w[ord], type = "l", lwd = 2,
+       xlab = "Position spatiale", ylab = "Champ latent",
+       main = "Champ latent simulé")
+
+  plot(xloc, lambda[ord], type = "l", lwd = 2,
+       xlab = "Position spatiale", ylab = expression(lambda),
+       main = "Intensité de Poisson")
+
+  plot(xloc, y[ord], pch = 16, cex = 0.6,
+       xlab = "Position spatiale", ylab = "Comptage",
+       main = "Observations de Poisson")
+}
+
+if (dimension == 2) {
+  plot_spatial_field(locs, w, main = "Champ latent simulé")
+  plot_spatial_field(locs, lambda, main = "Intensité de Poisson")
+  plot_spatial_field(locs, y, main = "Observations de comptage")
+}
+```
+
+# Préparation de la cible postérieure pour MALA
+
+Dans cette partie, $X$, $\beta$ et les paramètres spatiaux sont supposés
+fixés. Le seul vecteur échantillonné est $w$.
+
+La log-vraisemblance de Poisson est
+
+$$\log p(y\mid w)
+=
+\sum_{i=1}^n
+\left[
+y_i\eta_i-\exp(\eta_i)-\log(y_i!)
+\right].$$
+
+Le terme $\log(y_i!)$ ne dépend pas de $w$ et peut donc être supprimé
+dans l'algorithme MALA.
+
+Le prior spatial s'écrit
+
+$$\log p(w)
+=
+-\frac12\|\widetilde Rw\|^2+C.$$
+
+Ainsi,
+
+$$\log\pi(w\mid y)
+=
+\sum_{i=1}^n
+\left[
+y_i\eta_i-\exp(\eta_i)
+\right]
+-
+\frac12\|\widetilde Rw\|^2
++C.$$
+
+## Log-posterior de Poisson
+
+La fonction suivante calcule la log-postérieure à une constante additive
+près. Le prior est évalué directement à partir de $\widetilde R$, sans
+former de matrice dense.
+
+```{r}
+log_posterior_poisson <- function(w_current, y, X, beta, R_tilde) {
+
+  eta_current = as.vector(X %*% beta + w_current)
+
+  if (any(eta_current > 700)) return(-Inf)
+
+  lambda_current = exp(eta_current)
+
+  log_likelihood = sum(y * eta_current - lambda_current)
+
+  Rw = as.vector(R_tilde %*% w_current)
+  log_prior = -0.5 * sum(Rw^2)
+
+  log_likelihood + log_prior
+}
+```
+
+# Gradient analytique du log-posterior
+
+Pour la partie Poisson,
+
+$$\nabla_w\log p(y\mid w)=y-\lambda.$$
+
+Pour le prior,
+
+$$\nabla_w\log p(w)
+=-\widetilde R^\top\widetilde Rw.$$
+
+Le gradient total est donc
+
+$$\boxed{
+\nabla_w\log\pi(w\mid y)
+=
+y-\lambda-\widetilde R^\top\widetilde Rw
+}.$$
+
+Le code calcule directement les produits par $\widetilde R$ et
+$\widetilde R^\top$, ce qui est adapté aux matrices creuses.
+
+```{r}
+gradient_log_posterior_poisson <- function(w_current, y, X, beta, R_tilde) {
+
+  eta_current = as.vector(X %*% beta + w_current)
+  eta_for_exp = pmin(eta_current, 700)
+  lambda_current = exp(eta_for_exp)
+
+  gradient_likelihood = y - lambda_current
+
+  Rw = R_tilde %*% w_current
+
+  gradient_prior = -as.vector(
+    Matrix::crossprod(R_tilde, Rw)
+  )
+
+  gradient_likelihood + gradient_prior
+}
+```
+
+# Validation numérique du gradient
+
+Avant d'utiliser le gradient dans Newton puis MALA, je le compare à des
+différences finies centrées. Comme $n$ peut être élevé, seules quelques
+composantes réparties dans le champ sont contrôlées.
+
+```{r}
+w_test = rep(0, n)
+
+indices_test = unique(
+  pmin(n, c(1, 10, 100, 500, 1000, n))
+)
+
+epsilon = 1e-6
+```
+
+Je calcule le gradient analytique au point test.
+
+```{r}
+gradient_analytique = gradient_log_posterior_poisson(
+  w_current = w_test,
+  y = y,
+  X = X,
+  beta = beta,
+  R_tilde = R_tilde
+)
+```
+
+Puis on calcule les dérivées numériques centrées.
+
+```{r}
+verification_gradient = data.frame(
+  index = indices_test,
+  gradient_analytique = NA_real_,
+  gradient_numerique = NA_real_,
+  difference = NA_real_
+)
+
+for (k in seq_along(indices_test)) {
+
+  j = indices_test[k]
+
+  w_plus = w_test
+  w_plus[j] = w_plus[j] + epsilon
+
+  w_minus = w_test
+  w_minus[j] = w_minus[j] - epsilon
+
+  logpost_plus = log_posterior_poisson(
+    w_plus, y, X, beta, R_tilde
+  )
+
+  logpost_minus = log_posterior_poisson(
+    w_minus, y, X, beta, R_tilde
+  )
+
+  gradient_numerique =
+    (logpost_plus - logpost_minus) / (2 * epsilon)
+
+  verification_gradient$gradient_analytique[k] =
+    gradient_analytique[j]
+
+  verification_gradient$gradient_numerique[k] =
+    gradient_numerique
+
+  verification_gradient$difference[k] =
+    abs(gradient_analytique[j] - gradient_numerique)
+}
+
+verification_gradient
+```
+
+# Hessienne et géométrie locale
+
+La dérivée de $\lambda_i=\exp(\eta_i)$ par rapport à $w_i$ vaut
+$\lambda_i$. La Hessienne de la log-vraisemblance est donc
+
+$$-\operatorname{diag}(\lambda).$$
+
+En ajoutant le prior,
+
+$$\nabla_w^2\log\pi(w\mid y)
+=
+-\left[
+Q_0+\operatorname{diag}(\lambda)
+\right].$$
+
+Je définit alors
+
+$$Q(w)=Q_0+\operatorname{diag}(\lambda(w)).$$
+
+Cette matrice dépend de $w$. Elle représente la courbure locale de la
+cible, mais elle n'est pas une précision postérieure exacte.
+
+# Calcul du MAP du champ latent
+
+Le MAP est défini par
+
+$$w_{\mathrm{MAP}}
+=
+\arg\max_w\log\pi(w\mid y).$$
+
+L'équation stationnaire est
+
+$$y-\lambda(w_{\mathrm{MAP}})-Q_0w_{\mathrm{MAP}}=0.$$
+
+Une itération de Newton utilise
+
+$$w_{\mathrm{new}}
+=
+w+
+\left[
+Q_0+\operatorname{diag}(\lambda(w))
+\right]^{-1}
+\nabla\log\pi(w\mid y).$$
+
+Dans le cas Poisson, la courbure peut varier fortement. Pour rendre
+Newton plus robuste, j' ajoute un backtracking : si le pas proposé
+diminue le log-posterior, le pas est progressivement réduit.
+
+```{r}
+find_map_poisson <- function(
+    y, X, beta, R_tilde,
+    w_initial = NULL,
+    tolerance = 1e-6,
+    max_iter = 100,
+    verbose = FALSE) {
+
+  n = length(y)
+
+  if (is.null(w_initial)) {
+    w_current = rep(0, n)
+  } else {
+    w_current = as.vector(w_initial)
+  }
+
+  Q0 = Matrix::crossprod(R_tilde)
+  converged = FALSE
+
+  for (iter in seq_len(max_iter)) {
+
+    eta_current = as.vector(X %*% beta + w_current)
+
+    if (any(eta_current > 700)) {
+      stop("Valeur de eta trop grande pendant le calcul du MAP.")
+    }
+
+    lambda_current = exp(eta_current)
+
+    gradient = y - lambda_current -
+      as.vector(
+        Matrix::crossprod(
+          R_tilde,
+          R_tilde %*% w_current
+        )
+      )
+
+    Q_current = Q0
+    Matrix::diag(Q_current) =
+      Matrix::diag(Q_current) + lambda_current
+
+    direction = as.vector(
+      Matrix::solve(Q_current, gradient)
+    )
+
+    logpost_current = log_posterior_poisson(
+      w_current, y, X, beta, R_tilde
+    )
+
+    step_newton = 1
+
+    repeat {
+
+      w_candidate = w_current + step_newton * direction
+
+      logpost_candidate = log_posterior_poisson(
+        w_candidate, y, X, beta, R_tilde
+      )
+
+      if (is.finite(logpost_candidate) &&
+          logpost_candidate >= logpost_current) {
+        break
+      }
+
+      step_newton = step_newton / 2
+
+      if (step_newton < 1e-8) break
+    }
+
+    w_new = w_current + step_newton * direction
+
+    difference = max(abs(w_new - w_current))
+
+    if (verbose) {
+      cat(
+        "Iteration =", iter,
+        " | pas Newton =", step_newton,
+        " | difference =", difference,
+        "\n"
+      )
+    }
+
+    w_current = w_new
+
+    if (difference < tolerance) {
+      converged = TRUE
+      break
+    }
+  }
+
+  eta_map = as.vector(X %*% beta + w_current)
+  lambda_map = exp(eta_map)
+
+  prior_precision = Matrix::crossprod(R_tilde)
+
+  posterior_precision_map = prior_precision
+  Matrix::diag(posterior_precision_map) =
+    Matrix::diag(posterior_precision_map) + lambda_map
+
+  return(list(
+    w_map = w_current,
+    lambda_map = lambda_map,
+    prior_precision = prior_precision,
+    posterior_precision_map = posterior_precision_map,
+    converged = converged,
+    iterations = iter
+  ))
+}
+```
+
+Je calcule ensuite le MAP pour la configuration de validation.
+
+```{r}
+MAP = find_map_poisson(
+  y = y,
+  X = X,
+  beta = beta,
+  R_tilde = R_tilde,
+  w_initial = rep(0, n),
+  tolerance = 1e-6,
+  max_iter = 100,
+  verbose = TRUE
+)
+
+MAP$converged
+MAP$iterations
+summary(MAP$w_map)
+summary(MAP$lambda_map)
+```
+
+# Vérification du MAP
+
+Si Newton a convergé vers un mode, le gradient de la log-postérieure
+doit être proche de zéro.
+
+```{r}
+gradient_map = gradient_log_posterior_poisson(
+  w_current = MAP$w_map,
+  y = y,
+  X = X,
+  beta = beta,
+  R_tilde = R_tilde
+)
+
+c(
+  max_abs_gradient = max(abs(gradient_map)),
+  norme_gradient = sqrt(sum(gradient_map^2))
+)
+```
+
+Je compare également le MAP au champ latent simulé.
+
+```{r}
+c(
+  correlation_MAP = cor(w, MAP$w_map),
+  RMSE_MAP = sqrt(mean((w - MAP$w_map)^2))
+)
+```
+
+# Construction des préconditionnements pour MALA
+
+Le préconditionnement prior utilise
+
+$$Q_0=\widetilde R^\top\widetilde R.$$
+
+Le préconditionnement au MAP utilise
+
+$$Q_{\mathrm{MAP}}
+=
+Q_0+\operatorname{diag}(\lambda_{\mathrm{MAP}}).$$
+
+Le second incorpore donc l'information locale de la vraisemblance au
+voisinage du mode.
+
+```{r}
+prior_precision = MAP$prior_precision
+posterior_precision_map = MAP$posterior_precision_map
+
+dim(prior_precision)
+dim(posterior_precision_map)
+```
+
+# Factorisations de Cholesky des préconditionnements
+
+Les matrices de précision sont factorisées une seule fois. Les facteurs
+creux obtenus sont ensuite utilisés à chaque itération MALA.
+
+```{r}
+conditioning_prior = Matrix::expand(
+  Matrix::Cholesky(
+    prior_precision,
+    LDL = FALSE,
+    perm = TRUE,
+    super = FALSE
+  )
+)
+
+conditioning_map = Matrix::expand(
+  Matrix::Cholesky(
+    posterior_precision_map,
+    LDL = FALSE,
+    perm = TRUE,
+    super = FALSE
+  )
+)
+```
+
+# MALA préconditionné avec momentum
+
+L'algorithme conserve la même structure que dans le modèle binaire. À
+chaque itération, le momentum est partiellement rafraîchi, deux demi-pas
+de gradient encadrent un déplacement préconditionné du champ, puis une
+correction de Metropolis garantit l'invariance de la distribution cible.
+
+Pendant le burn-in, le pas est adapté par Robbins--Monro pour viser un
+taux d'acceptation de $0.574$.
+
+Après le burn-in, la moyenne et la variance postérieures sont calculées
+en ligne avec l'algorithme de Welford. Seules 100 composantes sont
+stockées pour le calcul de l'ESS.
+
+```{r}
+ess_indices = unique(
+  round(
+    seq(1, n, length.out = min(100, n))
+  )
+)
+```
+
+```{r}
+fct_mala_precond_momentum_poisson <- function(
+    R_tilde, X, beta, y,
+    n_iter, burn_in, rho,
+    conditioning_mat,
+    w_initial,
+    ess_indices) {
+
+  s = 1
+  n = length(y)
+  target_accept = 0.574
+
+  P = conditioning_mat$P
+  L = conditioning_mat$L
+
+  if (is.null(P)) {
+    P = Matrix::Diagonal(nrow(L))
+  }
+
+  solveCond <- function(v) {
+    as.vector(
+      Matrix::crossprod(
+        P,
+        Matrix::solve(
+          Matrix::t(L),
+          Matrix::solve(L, P %*% v)
+        )
+      )
+    )
+  }
+
+  solveCholCond <- function() {
+    as.vector(
+      Matrix::crossprod(
+        P,
+        L %*% rnorm(n)
+      )
+    )
+  }
+
+  xb = as.vector(X %*% beta)
+
+  logpi <- function(w) {
+
+    eta = xb + w
+
+    if (any(eta > 700)) return(-Inf)
+
+    lambda = exp(eta)
+
+    log_likelihood = sum(y * eta - lambda)
+    log_prior = -0.5 * sum((R_tilde %*% w)^2)
+
+    log_likelihood + log_prior
+  }
+
+  grad <- function(w) {
+
+    eta = xb + w
+    eta_for_exp = pmin(eta, 700)
+    lambda = exp(eta_for_exp)
+
+    y - lambda -
+      as.vector(
+        Matrix::crossprod(
+          R_tilde,
+          R_tilde %*% w
+        )
+      )
+  }
+
+  kinetic <- function(p) {
+    0.5 * as.numeric(
+      Matrix::crossprod(p, solveCond(p))
+    )
+  }
+
+  H <- function(w, p) {
+    -logpi(w) + kinetic(p)
+  }
+
+  w = as.vector(w_initial)
+  p = solveCholCond()
+  log_s = log(s)
+
+  n_post = n_iter - burn_in
+  mean_w = numeric(n)
+  M2_w = numeric(n)
+
+  trace_ess = matrix(
+    NA_real_,
+    nrow = n_post,
+    ncol = length(ess_indices)
+  )
+
+  accept = integer(n_iter)
+  s_history = numeric(n_iter)
+  compteur_post = 0L
+
+  for (i in seq_len(n_iter)) {
+
+    eps = exp(log_s)
+    accepte = 0L
+
+    p_ref = rho * p +
+      sqrt(1 - rho^2) * solveCholCond()
+
+    p_half = p_ref +
+      (eps / 2) * grad(w)
+
+    w_prop = w +
+      eps * solveCond(p_half)
+
+    p_prop = p_half +
+      (eps / 2) * grad(w_prop)
+
+    log_alpha =
+      -H(w_prop, p_prop) +
+      H(w, p_ref)
+
+    log_acc = if (is.finite(log_alpha)) {
+      min(0, log_alpha)
+    } else {
+      -Inf
+    }
+
+    if (log(runif(1)) < log_acc) {
+      w = w_prop
+      p = p_prop
+      accepte = 1L
+    } else {
+      p = -p_ref
+    }
+
+    if (i <= burn_in) {
+      gamma = 1 / (i + 10)^0.6
+      log_s = log_s + gamma * (accepte - target_accept)
+      log_s = max(log(1e-6), min(log_s, log(10)))
+    }
+
+    accept[i] = accepte
+    s_history[i] = exp(log_s)
+
+    if (i > burn_in) {
+
+      compteur_post = compteur_post + 1L
+
+      delta = w - mean_w
+      mean_w = mean_w + delta / compteur_post
+      M2_w = M2_w + delta * (w - mean_w)
+
+      trace_ess[compteur_post, ] = w[ess_indices]
+    }
+  }
+
+  variance_w = M2_w / (compteur_post - 1)
+  sd_w = sqrt(variance_w)
+
+  ess = as.numeric(
+    coda::effectiveSize(
+      coda::as.mcmc(trace_ess)
+    )
+  )
+
+  ind_post = (burn_in + 1):n_iter
+
+  return(list(
+    mean_w = mean_w,
+    variance_w = variance_w,
+    sd_w = sd_w,
+    ess_mean = mean(ess, na.rm = TRUE),
+    ess_median = median(ess, na.rm = TRUE),
+    ess_min = min(ess, na.rm = TRUE),
+    ess_max = max(ess, na.rm = TRUE),
+    accept_rate = mean(accept),
+    accept_rate_post = mean(accept[ind_post]),
+    final_step = exp(log_s),
+    s_history = s_history
+  ))
+}
+```
+
+# Validation sur une configuration
+
+Avant de lancer le plan factoriel, les deux préconditionnements sont
+comparés sur le même jeu de données. Le MAP est utilisé comme point
+initial.
+
+## Préconditionnement prior
+
+```{r}
+set.seed(1001)
+
+temps_prior = system.time({
+  MCMC_prior = fct_mala_precond_momentum_poisson(
+    R_tilde = R_tilde,
+    X = X,
+    beta = beta,
+    y = y,
+    n_iter = n_iter,
+    burn_in = burn_in,
+    rho = rho,
+    conditioning_mat = conditioning_prior,
+    w_initial = MAP$w_map,
+    ess_indices = ess_indices
+  )
+})
+```
+
+```{r}
+c(
+  accept_post = MCMC_prior$accept_rate_post,
+  final_step = MCMC_prior$final_step,
+  ess_mean = MCMC_prior$ess_mean,
+  ess_median = MCMC_prior$ess_median,
+  ess_min = MCMC_prior$ess_min,
+  ess_max = MCMC_prior$ess_max,
+  elapsed = temps_prior["elapsed"]
+)
+```
+
+## Préconditionnement au MAP
+
+```{r}
+set.seed(1002)
+
+temps_map = system.time({
+  MCMC_map = fct_mala_precond_momentum_poisson(
+    R_tilde = R_tilde,
+    X = X,
+    beta = beta,
+    y = y,
+    n_iter = n_iter,
+    burn_in = burn_in,
+    rho = rho,
+    conditioning_mat = conditioning_map,
+    w_initial = MAP$w_map,
+    ess_indices = ess_indices
+  )
+})
+```
+
+```{r}
+c(
+  accept_post = MCMC_map$accept_rate_post,
+  final_step = MCMC_map$final_step,
+  ess_mean = MCMC_map$ess_mean,
+  ess_median = MCMC_map$ess_median,
+  ess_min = MCMC_map$ess_min,
+  ess_max = MCMC_map$ess_max,
+  elapsed = temps_map["elapsed"]
+)
+```
+
+# Reconstruction du champ latent
+
+La qualité de reconstruction est évaluée par la corrélation, la RMSE et
+la MAE entre le champ latent simulé et la moyenne postérieure.
+
+```{r}
+reconstruction_prior = c(
+  correlation = cor(w, MCMC_prior$mean_w),
+  RMSE = sqrt(mean((w - MCMC_prior$mean_w)^2)),
+  MAE = mean(abs(w - MCMC_prior$mean_w))
+)
+
+reconstruction_map = c(
+  correlation = cor(w, MCMC_map$mean_w),
+  RMSE = sqrt(mean((w - MCMC_map$mean_w)^2)),
+  MAE = mean(abs(w - MCMC_map$mean_w))
+)
+
+reconstruction_prior
+reconstruction_map
+```
+
+# Variance marginale postérieure
+
+Pour chaque composante,
+
+$$\widehat{\operatorname{Var}}(w_i\mid y)
+=
+\frac{1}{N-1}
+\sum_{t=1}^{N}
+\left(w_i^{(t)}-\bar w_i\right)^2.$$
+
+Cette variance représente l'incertitude postérieure locale. Elle ne doit
+pas être interprétée comme une erreur de reconstruction.
+
+Contrairement au cas gaussien, aucune variance postérieure exacte n'est
+disponible analytiquement. On ne calcule donc pas de RMSE de variance
+par rapport à une référence exacte.
+
+```{r}
+summary(MCMC_prior$variance_w)
+summary(MCMC_map$variance_w)
+```
+
+# Cartes de reconstruction et d'incertitude
+
+Pour la stratégie MAP, quatre informations sont représentées : les
+comptages, le champ latent simulé, la moyenne postérieure et la variance
+marginale postérieure.
+
+```{r}
+if (dimension == 2) {
+  plot_spatial_field(locs, y,
+                     main = "Observations de comptage")
+  plot_spatial_field(locs, w,
+                     main = "Champ latent simulé")
+  plot_spatial_field(locs, MCMC_map$mean_w,
+                     main = "Moyenne postérieure")
+  plot_spatial_field(locs, MCMC_map$variance_w,
+                     main = "Variance postérieure marginale")
+}
+```
+
+# Tableau récapitulatif de la validation
+
+Cette table rassemble les diagnostics essentiels avant de passer à
+l'expérience factorielle.
+
+```{r}
+validation_results = data.frame(
+  conditioning = c("Prior", "MAP"),
+  accept_rate_post = c(
+    MCMC_prior$accept_rate_post,
+    MCMC_map$accept_rate_post
+  ),
+  final_step = c(
+    MCMC_prior$final_step,
+    MCMC_map$final_step
+  ),
+  ess_mean = c(
+    MCMC_prior$ess_mean,
+    MCMC_map$ess_mean
+  ),
+  ess_median = c(
+    MCMC_prior$ess_median,
+    MCMC_map$ess_median
+  ),
+  ess_min = c(
+    MCMC_prior$ess_min,
+    MCMC_map$ess_min
+  ),
+  correlation = c(
+    reconstruction_prior["correlation"],
+    reconstruction_map["correlation"]
+  ),
+  RMSE = c(
+    reconstruction_prior["RMSE"],
+    reconstruction_map["RMSE"]
+  ),
+  mean_variance = c(
+    mean(MCMC_prior$variance_w),
+    mean(MCMC_map$variance_w)
+  ),
+  elapsed = c(
+    temps_prior["elapsed"],
+    temps_map["elapsed"]
+  )
+)
+
+validation_results
+```
+
+# Contrôles avant l'expérience factorielle
+
+Avant de lancer l'expérience complète, je vérifie que les comptages sont
+raisonnables, que Newton converge et que MALA atteint un taux
+d'acceptation proche de la cible.
+
+```{r}
+summary(y)
+
+c(
+  proportion_zero = mean(y == 0),
+  mean_y = mean(y),
+  max_y = max(y)
+)
+```
+
+```{r}
+c(
+  MAP_converged = MAP$converged,
+  MAP_iterations = MAP$iterations,
+  max_abs_gradient_MAP = max(abs(gradient_map))
+)
+```
+
+```{r}
+validation_results[
+  ,
+  c(
+    "conditioning",
+    "accept_rate_post",
+    "final_step",
+    "ess_median",
+    "ess_min",
+    "RMSE"
+  )
+]
+```
+
+# Expérience factorielle parallèle
+
+Une fois la validation terminée, je peux construire un plan factoriel
+analogue à celui du modèle binaire. Les facteurs spatiaux et les valeurs
+de $\rho$ sont conservés. Les valeurs de $\beta_0$ proposées sont plus
+basses afin de limiter les intensités extrêmes.
+
+```{r}
+experiment_parameters = as.matrix(
+  expand.grid(
+    sigma2 = c(0.5, 1, 2),
+    nu = c(0.5, 1.5),
+    range = c(0.05, 0.2, 0.5),
+    beta0 = c(-1.5, -1, -0.5),
+    rho = c(0, 0.5, 0.9),
+    conditioning = c(1, 2),
+    seed = 1:5
+  )
+)
+
+dim(experiment_parameters)
+```
+
+Le plan contient
+
+$$3\times2\times3\times3\times3\times2\times5=1620$$
+
+chaînes. Ces valeurs de $\beta_0$ doivent être validées avant le
+lancement complet.
+
+## Fonction d'une expérience
+
+La fonction suivante regroupe toutes les opérations effectuées pour une
+ligne du plan : simulation spatiale, génération des comptages, MAP,
+préconditionnement, MALA, diagnostics, reconstruction et résumé de la
+variance postérieure. Elle ne retourne pas la chaîne complète afin de
+limiter la mémoire.
+
+```{r}
+run_poisson_experiment <- function(
+    params,
+    dimension,
+    n,
+    nb_nn,
+    n_iter,
+    burn_in,
+    ess_indices) {
+
+  names(params) = colnames(experiment_parameters)
+
+  sigma2 = as.numeric(params["sigma2"])
+  nu = as.numeric(params["nu"])
+  range = as.numeric(params["range"])
+  beta0 = as.numeric(params["beta0"])
+  rho = as.numeric(params["rho"])
+  conditioning = as.integer(params["conditioning"])
+  seed = as.integer(params["seed"])
+
+  beta = c(beta0, 0.01)
+
+  set.seed(seed)
+
+  locs = createLocs(dimension, n)
+  X = cbind(1, rnorm(n))
+
+  NNarray = GpGp::find_ordered_nn(locs, nb_nn)
+
+  Linv = GpGp::vecchia_Linv(
+    c(sigma2, range / sqrt(nu), nu, 0.0001),
+    "matern_isotropic", locs, NNarray
+  )
+
+  R_tilde = Matrix::sparseMatrix(
+    i = row(NNarray)[!is.na(NNarray)],
+    j = NNarray[!is.na(NNarray)],
+    x = Linv[!is.na(NNarray)],
+    dims = c(n, n),
+    triangular = TRUE
+  )
+
+  w = as.vector(Matrix::solve(R_tilde, rnorm(n)))
+
+  eta = as.vector(X %*% beta + w)
+
+  if (max(eta) > 30) {
+    stop("Configuration avec eta trop élevé : revoir beta0 ou les paramètres spatiaux.")
+  }
+
+  lambda = exp(eta)
+  y = rpois(n, lambda)
+
+  MAP = find_map_poisson(
+    y = y,
+    X = X,
+    beta = beta,
+    R_tilde = R_tilde,
+    tolerance = 1e-6,
+    max_iter = 100,
+    verbose = FALSE
+  )
+
+  if (conditioning == 1) {
+    conditioning_precision = MAP$prior_precision
+  }
+
+  if (conditioning == 2) {
+    conditioning_precision = MAP$posterior_precision_map
+  }
+
+  conditioning_mat = Matrix::expand(
+    Matrix::Cholesky(
+      conditioning_precision,
+      LDL = FALSE,
+      perm = TRUE,
+      super = FALSE
+    )
+  )
+
+  mcmc_seed =
+    seed * 10000000 +
+    match(sigma2, c(0.5, 1, 2)) * 1000000 +
+    match(nu, c(0.5, 1.5)) * 100000 +
+    match(range, c(0.05, 0.2, 0.5)) * 10000 +
+    match(beta0, c(-1.5, -1, -0.5)) * 1000 +
+    match(rho, c(0, 0.5, 0.9)) * 10 +
+    conditioning
+
+  set.seed(mcmc_seed)
+
+  temps = system.time({
+    MCMC = fct_mala_precond_momentum_poisson(
+      R_tilde = R_tilde,
+      X = X,
+      beta = beta,
+      y = y,
+      n_iter = n_iter,
+      burn_in = burn_in,
+      rho = rho,
+      conditioning_mat = conditioning_mat,
+      w_initial = MAP$w_map,
+      ess_indices = ess_indices
+    )
+  })
+  
+  
+  experiment_dir = file.path(
+    paste0("Poisson_experiment_results_dim", dimension),
+    paste0(
+      "seed_", seed,
+      "_sigma2_", sigma2,
+      "_nu_", nu,
+      "_range_", range,
+      "_beta0_", beta0,
+      "_rho_", rho,
+      "_conditioning_", conditioning
+    )
+  )
+  
+  dir.create(experiment_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  if (dimension == 1) {
+    ord = order(locs[, 1])
+    x = locs[ord, 1]
+    
+    png(file.path(experiment_dir, "observed.png"),
+        width = 1200, height = 900, res = 150)
+    plot(x, y[ord], pch = 16, cex = 0.5,
+         col = ifelse(y[ord] == 1, "orange", "black"),
+         xlab = "Position spatiale", ylab = "Observation",
+         main = "Données binaires observées")
+    dev.off()
+    
+    png(file.path(experiment_dir, "latent.png"),
+        width = 1200, height = 900, res = 150)
+    plot(x, w[ord], type = "l", lwd = 2,
+         xlab = "Position spatiale", ylab = "Champ latent",
+         main = "Champ latent simulé")
+    dev.off()
+    
+    png(file.path(experiment_dir, "estimated_mean.png"),
+        width = 1200, height = 900, res = 150)
+    plot(x, MCMC$mean_w[ord], type = "l", lwd = 2,
+         xlab = "Position spatiale", ylab = "Moyenne postérieure",
+         main = "Moyenne postérieure estimée")
+    dev.off()
+    
+    png(file.path(experiment_dir, "posterior_variance.png"),
+        width = 1200, height = 900, res = 150)
+    plot(x, MCMC$variance_w[ord], type = "l", lwd = 2,
+         xlab = "Position spatiale", ylab = "Variance postérieure",
+         main = "Variance postérieure marginale estimée")
+    dev.off()
+  }
+  
+  if (dimension == 2) {
+    
+    png( filename = file.path( experiment_dir, "observed.png" ) )
+    GeoNonStat::plotPointillistPainting(locs, y, cex = 20 )
+    title( main = "Données observées" )
+    dev.off()
+    
+    # Champ latent simulé
+    png( filename = file.path( experiment_dir,"latent.png") )
+    GeoNonStat::plotPointillistPainting( locs, w, cex = 20)
+    title( main = "Champ latent simulé")
+    dev.off()
+    
+    # Moyenne postérieure
+    png( filename = file.path( experiment_dir, "estimated_mean.png" ) )
+    GeoNonStat::plotPointillistPainting( locs, MCMC$mean_w, cex = 20 )
+    title( main = "Moyenne postérieure estimée")
+    dev.off()
+    
+    # Variance postérieure
+    png( filename = file.path( experiment_dir, "posterior_variance.png" ) )
+    GeoNonStat::plotPointillistPainting( locs, MCMC$variance_w, cex = 20)
+    title( main = "Variance postérieure marginale estimée" )
+    dev.off()
+  }
+
+  RMSE = sqrt(mean((w - MCMC$mean_w)^2))
+  MAE = mean(abs(w - MCMC$mean_w))
+  correlation = cor(w, MCMC$mean_w)
+
+  return(c(
+    sigma2 = sigma2,
+    nu = nu,
+    range = range,
+    beta0 = beta0,
+    rho = rho,
+    conditioning = conditioning,
+    seed = seed,
+    mean_lambda = mean(lambda),
+    max_lambda = max(lambda),
+    mean_y = mean(y),
+    max_y = max(y),
+    proportion_zero = mean(y == 0),
+    MAP_converged = as.numeric(MAP$converged),
+    MAP_iterations = MAP$iterations,
+    ess_mean = MCMC$ess_mean,
+    ess_median = MCMC$ess_median,
+    ess_min = MCMC$ess_min,
+    ess_max = MCMC$ess_max,
+    accept_rate = MCMC$accept_rate,
+    accept_rate_post = MCMC$accept_rate_post,
+    final_step = MCMC$final_step,
+    RMSE = RMSE,
+    MAE = MAE,
+    correlation = correlation,
+    mean_posterior_variance = mean(MCMC$variance_w),
+    elapsed = as.numeric(temps["elapsed"])
+  ))
+}
+```
+
+# Test de la fonction factorielle
+
+Avant de créer un cluster, je teste une seule ligne du plan. Cela permet
+de repérer facilement les erreurs de dimensions, de MAP ou de Cholesky.
+
+```{r}
+test_factorial = run_poisson_experiment(
+  params = experiment_parameters[1, ],
+  dimension = dimension,
+  n = n,
+  nb_nn = nb_nn,
+  n_iter = n_iter,
+  burn_in = burn_in,
+  ess_indices = ess_indices
+)
+
+test_factorial
+```
+
+# Exécution parallèle
+
+Cette section est exécutée uniquement lorsque le test précédent
+fonctionne. Je crée un cluster avec environ la moitié des cœurs
+disponibles.
+
+```{r}
+cl = parallel::makeCluster(
+  max(1, floor(parallel::detectCores() * 0.5))
+)
+```
+
+Les fonctions et objets nécessaires sont ensuite exportés vers les
+workers.
+
+```{r}
+parallel::clusterExport(
+  cl,
+  varlist = c(
+    "experiment_parameters",
+    "burn_in",
+    "n_iter",
+    "dimension",
+    "n",
+    "nb_nn",
+    "ess_indices",
+    "createLocs",
+    "log_posterior_poisson",
+    "gradient_log_posterior_poisson",
+    "find_map_poisson",
+    "fct_mala_precond_momentum_poisson",
+    "run_poisson_experiment"
+  ),
+  envir = .GlobalEnv
+)
+```
+
+J'exécute ensuite le plan factoriel.
+
+```{r}
+experiment_results = parallel::parLapply(
+  cl = cl,
+  X = split(
+    experiment_parameters,
+    row(experiment_parameters)
+  ),
+  fun = function(params) {
+    run_poisson_experiment(
+      params = params,
+      dimension = dimension,
+      n = n,
+      nb_nn = nb_nn,
+      n_iter = n_iter,
+      burn_in = burn_in,
+      ess_indices = ess_indices
+    )
+  }
+)
+```
+
+À la fin des calculs, le cluster est arrêté.
+
+```{r}
+parallel::stopCluster(cl)
+```
+
+# Mise en forme et sauvegarde
+
+Les résultats sont regroupés dans un tableau puis sauvegardés en `.rds`
+et en `.csv`.
+
+```{r}
+experiment_results_df = as.data.frame(
+  do.call(rbind, experiment_results)
+)
+
+dim(experiment_results_df)
+head(experiment_results_df)
+```
+
+```{r}
+saveRDS(
+  experiment_results_df,
+  file = paste0(
+    "Poisson_experiment_results_dim",
+    dimension,
+    ".rds"
+  )
+)
+
+write.csv(
+  experiment_results_df,
+  file = paste0(
+    "Poisson_experiment_results_dim",
+    dimension,
+    ".csv"
+  ),
+  row.names = FALSE
+)
+```
+
+# Analyse des résultats factoriels
+
+L'analyse reprend la même logique que dans le modèle binaire. L'ESS
+médian est retenu comme critère principal d'efficacité et l'ESS minimal
+comme indicateur complémentaire de robustesse.
+
+## Résumé par préconditionnement
+
+Le code suivant calcule les moyennes des principaux diagnostics pour les
+deux préconditionnements.
+
+```{r}
+aggregate(
+  cbind(
+    ess_mean,
+    ess_median,
+    ess_min,
+    final_step,
+    accept_rate_post,
+    RMSE,
+    MAE,
+    correlation,
+    mean_posterior_variance,
+    elapsed
+  ) ~ conditioning,
+  data = experiment_results_df,
+  FUN = mean
+)
+```
+
+## Effet de $\rho$ et du préconditionnement
+
+Pour étudier conjointement la persistance du momentum et le
+préconditionnement, je résume l'ESS médian pour chaque combinaison.
+
+```{r}
+robustesse_poisson = aggregate(
+  ess_median ~ conditioning + rho,
+  data = experiment_results_df,
+  FUN = function(x) {
+    c(
+      moyenne = mean(x),
+      mediane = median(x),
+      sd = sd(x),
+      q10 = quantile(x, 0.10),
+      minimum = min(x)
+    )
+  }
+)
+
+robustesse_poisson
+```
+
+On produit ensuite un boxplot des ESS médians.
+
+```{r}
+experiment_results_df$conditioning_label = factor(
+  experiment_results_df$conditioning,
+  levels = c(1, 2),
+  labels = c("Prior", "MAP")
+)
+
+experiment_results_df$rho_factor = factor(
+  experiment_results_df$rho
+)
+
+ggplot(
+  experiment_results_df,
+  aes(
+    x = rho_factor,
+    y = ess_median,
+    fill = conditioning_label
+  )
+) +
+  geom_boxplot() +
+  labs(
+    x = expression(rho),
+    y = "ESS médian",
+    fill = "Préconditionnement",
+    title = "ESS médian selon rho et le préconditionnement"
+  ) +
+  theme_minimal()
+```
+
+# Modèle linéaire pour l'ESS médian
+
+Comme dans le modèle binaire, un modèle linéaire est utilisé pour
+étudier la sensibilité de l'ESS médian aux paramètres du modèle et à
+leurs interactions avec le préconditionnement. La graine est introduite
+comme facteur de contrôle.
+
+```{r}
+experiment_results_df$seed = factor(experiment_results_df$seed)
+
+experiment_results_df$conditioning_factor = factor(
+  experiment_results_df$conditioning,
+  levels = c(1, 2),
+  labels = c("prior", "MAP")
+)
+
+experiment_results_df$sigma2 = factor(experiment_results_df$sigma2)
+experiment_results_df$nu = factor(experiment_results_df$nu)
+experiment_results_df$range = factor(experiment_results_df$range)
+experiment_results_df$beta0 = factor(experiment_results_df$beta0)
+experiment_results_df$rho = factor(experiment_results_df$rho)
+```
+
+Le modèle ajusté est
+
+$$\mathrm{ESS}_{\mathrm{med}}
+\sim
+\mathrm{seed}
++\sigma^2\times\mathrm{conditionnement}
++\nu\times\mathrm{conditionnement}
++\ell^\star\times\mathrm{conditionnement}
++\beta_0\times\mathrm{conditionnement}
++\rho\times\mathrm{conditionnement}.$$
+
+```{r}
+modele_ess_poisson = lm(
+  ess_median ~
+    seed +
+    sigma2 * conditioning_factor +
+    nu * conditioning_factor +
+    range * conditioning_factor +
+    beta0 * conditioning_factor +
+    rho * conditioning_factor,
+  data = experiment_results_df
+)
+
+summary(modele_ess_poisson)
+```
+
+# Analyse de l'incertitude postérieure
+
+La variance moyenne calculée dans le plan factoriel décrit le niveau
+global d'incertitude postérieure des configurations.
+
+Elle ne doit toutefois pas être interprétée comme un critère direct de
+qualité MCMC : une variance postérieure plus faible ne signifie pas
+qu'une chaîne est meilleure. Elle décrit avant tout la concentration de
+la distribution cible.
+
+```{r}
+aggregate(
+  mean_posterior_variance ~ conditioning + rho,
+  data = experiment_results_df,
+  FUN = mean
+)
+```
+
+# Conclusion
+
+Le modèle de Poisson constitue une extension non binaire naturelle de
+l'étude. La vraisemblance est différente de celle du modèle
+Bernoulli-logistique, mais la même architecture algorithmique peut être
+conservée :
+
+$$\text{simulation}
+\rightarrow
+\text{MAP}
+\rightarrow
+\text{courbure locale}
+\rightarrow
+\text{préconditionnement}
+\rightarrow
+\text{MALA}.$$
+
+La principale différence avec le modèle binaire est que la courbure de
+la vraisemblance dépend directement des intensités $\lambda_i$. Les
+configurations produisant de grandes intensités peuvent donc conduire à
+une géométrie plus raide et nécessitent une attention particulière lors
+de la simulation et du calcul du MAP.
+
+Le document valide d'abord chaque étape sur une configuration unique
+avant de lancer le plan factoriel complet. Les résultats du plan
+permettront ensuite de déterminer si le préconditionnement au MAP
+associé à une persistance intermédiaire conserve le compromis entre
+performance et robustesse observé dans le modèle binaire.

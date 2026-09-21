@@ -1,0 +1,1397 @@
+---
+title: "MALA préconditionné dans le modèle binaire spatial"
+format:
+  html:
+    number-sections: true
+    toc: true
+    toc-depth: 3
+    code-summary: "Afficher le code"
+execute:
+  warning: false
+  message: false
+editor:
+  markdown:
+    wrap: 72
+---
+
+# Modèle binaire spatial
+
+Le modèle considéré est
+
+$$ y_i \mid w_i \sim \operatorname{Bernoulli}(p_i), $$
+
+avec
+
+$$ \operatorname{logit}(p_i) = x_i^\top\beta+w_i. $$
+
+Ainsi,
+
+$$ p_i = \frac{\exp(x_i^\top\beta+w_i)} {1+\exp(x_i^\top\beta+w_i)}. $$
+
+Le champ latent $w$ conserve la même structure gaussienne spatiale que
+dans le modèle gaussien. La différence concerne la distribution des
+observations : les valeurs de $y_i$ sont maintenant binaires.
+
+Avant d'étudier l'algorithme MALA, je vérifie que les observations
+simulées sont cohérentes avec les probabilités utilisées pour les
+générer.
+
+## Conventions
+
+| Code | Conditionnement  | Matrice              |
+|-----:|:-----------------|:---------------------|
+|    1 | prior            | $Q=R^\top R$         |
+|    2 | posterior au MAP | $Q+D_{\mathrm{MAP}}$ |
+
+# Paramètres et simulation d'un jeu de données
+
+Le même code est utilisé en dimensions 1 et 2. Le document doit être
+exécuté séparément pour chaque dimension.
+
+```{r}
+library(Matrix)
+library(GpGp)
+library(coda)
+library(ggplot2)
+library(parallel)
+
+#dimension = 1
+dimension = 2
+
+seed = 123
+set.seed(seed)
+
+n = 10000
+nb_nn = 6
+n_iter = 10000
+burn_in = 2000
+rho = 0.5
+
+nu = 1.5
+range = 0.2
+beta = c(1, 0.01)
+```
+
+La fonction suivante génère les sites spatiaux. En dimension 1, les
+sites sont triés sur $[0,1]$. En dimension 2, ils sont générés sur
+$[0,1]^2$.
+
+```{r}
+createLocs <- function(dimension, n) {
+  if (dimension == 1) locs = cbind(sort(runif(n)), 1)
+  if (dimension == 2) locs = cbind(runif(n), runif(n))
+  return(locs)
+}
+```
+
+# Construction du modèle spatial et simulation
+
+L'approximation de Vecchia est utilisée pour construire une matrice
+triangulaire creuse ${\tilde{R}}$. Le champ latent est simulé par
+
+$$w={\tilde{R}}^{-1}z,\qquad z\sim\mathcal N(0,I),$$
+
+puis les probabilités et les observations binaires sont obtenues par la
+transformation logistique.
+
+```{r}
+locs = createLocs(dimension, n)
+X = cbind(1, rnorm(n))
+
+NNarray = GpGp::find_ordered_nn(locs, nb_nn)
+Linv = GpGp::vecchia_Linv(c(1, range / nu, nu, 0.0001),
+                          "matern_isotropic", locs, NNarray)
+R_tilde = Matrix::sparseMatrix(
+  i = row(NNarray)[!is.na(NNarray)],
+  j = NNarray[!is.na(NNarray)],
+  x = Linv[!is.na(NNarray)],
+  triangular = TRUE
+)
+
+w = as.vector(solve(R_tilde, rnorm(n)))
+eta = as.vector(X %*% beta + w)
+proba = plogis(eta)
+y = rbinom(n, size = 1, prob = proba)
+```
+
+# Simulation des probabilités
+
+## Prédicteur linéaire
+
+Le prédicteur linéaire est
+
+$$ \eta_i=x_i^\top\beta+w_i. $$
+
+```{r}
+eta = as.vector( X %*% beta + w )
+
+summary(eta)
+range(eta)
+
+```
+
+```{r}
+hist( eta, main = "Distribution du prédicteur linéaire", xlab = expression(eta))
+```
+
+Un contrôle simple vérifie que la proportion observée de succès est
+cohérente avec la probabilité moyenne utilisée pour générer les données.
+
+```{r}
+c(probabilite_moyenne = mean(proba),
+  proportion_observee = mean(y),
+  difference = abs(mean(proba) - mean(y)))
+```
+
+Sur la configuration de validation en dimension 2
+$(n=10000,\nu=1.5,\mathrm{range}=0.2)$, la probabilité moyenne était
+d'environ $0.791$ et la proportion observée d'environ $0.786$. L'écart,
+de l'ordre de $5\times10^{-3}$, est compatible avec une réalisation
+Bernoulli de grande taille.
+
+## Transformation logistique
+
+Les probabilités sont obtenues par
+$$ p_i = \operatorname{logit}^{-1}(\eta_i). $$
+
+```{r}
+proba = plogis( eta)
+
+summary(proba)
+range(proba)
+mean(proba)
+sd(proba)
+
+```
+
+```{r}
+hist(proba,
+  xlim = c(0, 1),
+  main = "Distribution des probabilités",
+  xlab = expression(p[i])
+)
+abline( v = mean(proba), col = "red", lwd = 2, lty = 2 )
+
+```
+
+# Échantillonnage des observations binaires
+
+Les observations sont générées conditionnellement aux probabilités :
+
+```{r}
+y = rbinom( n = length(proba), size = 1, prob = proba )
+
+```
+
+## Vérification du support
+
+```{r}
+unique(y)
+table(y)
+all( y %in% c(0, 1) )
+
+```
+
+## Proportion de zéros et de uns
+
+```{r}
+prop.table( table(y) )
+mean(y)
+```
+
+La moyenne de (y) correspond à la proportion observée de valeurs égales
+à 1.
+
+```{r}
+c( proportion_observee = mean(y), probabilite_moyenne = mean(proba) )
+```
+
+```{r}
+difference_observee = abs( mean(y) - mean(proba) )
+difference_observee
+```
+
+# Vérification répétée de l'échantillonnage de (y)
+
+Une seule réalisation de (y) peut être légèrement éloignée de mean(p).
+Je répète donc l'échantillonnage en conservant les mêmes probabilités.
+
+```{r}
+n_sim_y = 2000
+proportion_y = numeric( n_sim_y )
+
+for (i in seq_len(n_sim_y)) {
+  y_sim = rbinom( n = length(proba), size = 1, prob = proba )
+  proportion_y[i]  = mean(y_sim)
+}
+```
+
+```{r}
+summary(proportion_y)
+```
+
+```{r}
+c(  moyenne_proportions_simulees = mean(proportion_y),
+    moyenne_probabilites = mean(proba)
+)
+```
+
+# Visualisation spatiale des observations
+
+## Visualisation conditionnelle à la dimension
+
+```{r}
+if (dimension == 1) {
+  ord = order( locs[, 1] )
+  plot( locs[ord, 1], proba[ord], type = "l", col = "blue", lwd = 2,
+    ylim = c(0, 1),
+    xlab = "Position spatiale",
+    ylab = "Probabilité ou observation",
+    main = "Probabilités et observations binaires en dimension 1"
+  )
+
+  points( locs[ord, 1], y[ord], pch = 16, 
+          col = ifelse( y[ord] == 1,"orange","black" ), cex = 0.7 )
+
+  legend( "topright", legend = c( "Probabilité","Observation égale à 1", 
+                                  "Observation égale à 0"),
+    
+    col = c("blue", "orange", "black" ),
+    lty = c( 1, NA, NA ),
+    pch = c( NA, 16, 16 ),
+    lwd = c( 2, NA, NA ),
+    bty = "n"
+  )
+}
+
+
+plotBinaire <- function(){}
+if (dimension == 2) {
+  plot( locs[, 1], locs[, 2],  pch = 15, cex = 0.5,
+        col = ifelse( y == 1, "orange" , "black"),
+        xlab = "Coordonnée 1",
+        ylab = "Coordonnée 2",
+        main = "Observations binaires en dimension 2"
+  )
+  
+
+  legend( "topright", 
+          legend = c( "y = 1", "y = 0" ),
+          col = c( "orange", "black" ), pch = 16, bty = "n")
+  
+}
+```
+
+# Comparaison spatiale entre (w), (p) et (y)
+
+Cette section permet de comparer la structure du champ latent, celle des
+probabilités et celle des observations.
+
+```{r}
+if (dimension == 1) {
+  ord = order(locs[, 1])
+  
+  par( mfrow = c(1, 1) )
+
+  plot( locs[ord, 1], w[ord], type = "l", lwd = 2,
+    xlab = "Position spatiale",
+    ylab = "w",
+    main = "Champ latent"
+  )
+
+  plot( locs[ord, 1], proba[ord], type = "l", col = "blue", lwd = 2,
+    ylim = c(0, 1),
+    xlab = "Position spatiale",
+    ylab = "Probabilité",
+    main = "Probabilités"
+  )
+
+  plot( locs[ord, 1], y[ord], pch = 16,
+    col = ifelse( y[ord] == 1, "orange", "black"),
+    xlab = "Position spatiale",
+    ylab = "Observation",
+    main = "Observations binaires"
+  )
+  par(mfrow = c(1, 1))
+}
+
+if (dimension == 2) {
+  
+  GeoNonStat::plotPointillistPainting( locs, w, cex = 7, main = "Champ latent")
+  
+  GeoNonStat::plotPointillistPainting( locs, proba, cex = 7, main = "Probabilités")
+
+  plot(locs[, 1], locs[, 2], pch = 16, cex = 0.8,
+    col = ifelse( y == 1, "orange", "black" ),
+    xlab = "Coordonnée 1",
+    ylab = "Coordonnée 2",
+    main = "Observations binaires"
+  )
+}
+```
+
+# Préparation de la cible postérieure pour MALA
+
+Dans cette partie, Je prépare les objets nécessaires à l'algorithme MALA
+pour le modèle binaire. Contrairement au cas gaussien, la vraisemblance
+n'est plus gaussienne : elle est Bernoulli avec lien logit.
+
+Je considère ici que $X$, $\beta$ et les paramètres spatiaux sont fixés.
+Le seul vecteur échantillonné par MALA sera le champ latent $w$.
+
+Le modèle est
+
+$$y_i\mid w_i \sim \operatorname{Bernoulli}(p_i),$$
+
+avec
+
+$$\eta_i=x_i^\top\beta+w_i,
+\qquad
+p_i=\operatorname{logit}^{-1}(\eta_i).$$
+
+Le prior spatial induit par l'approximation de Vecchia est défini par
+
+$$Q = {\tilde{R}}^\top {\tilde{R}},$$
+
+et donc, à une constante additive près,
+
+$$\log p(w)=-\frac12 w^\top Qw
+         =-\frac12\|{\tilde{R}}w\|^2.$$
+
+La suite consiste à :
+
+1.  définir le log-posterior binaire ;
+2.  définir son gradient analytique ;
+3.  vérifier numériquement ce gradient ;
+4.  calculer le MAP du champ latent ;
+5.  comparer le MAP au champ latent simulé ;
+6.  construire les deux préconditionnements retenus pour MALA :
+    **prior** et **posterior évalué au MAP**.
+
+## Log-posterior binaire
+
+La log-vraisemblance Bernoulli est
+
+$$\log p(y\mid w)
+=
+\sum_{i=1}^n
+\left[
+ y_i\log(p_i)+(1-y_i)\log(1-p_i)
+\right].$$
+
+Le log-posterior de $w$, à une constante près, est donc
+
+$$\log \pi(w\mid y)
+=
+\log p(y\mid w)
+-
+\frac12\|{\tilde{R}}w\|^2.$$
+
+Dans le code, `dbinom(..., log = TRUE)` est utilisé pour calculer la
+log-vraisemblance de manière numériquement stable.
+
+```{r}
+log_posterior_binary <- function( w_current, y, X, beta, R_tilde ) {
+
+  # Calcul du prédicteur linéaire courant
+  eta_current = as.vector(X %*% beta + w_current)
+
+  # Transformation logistique 
+  proba_current = plogis( eta_current )
+  
+  # Log-vraisemblance Bernoulli 
+  log_likelihood = sum( dbinom( y, size = 1, prob = proba_current, log = TRUE ) )
+
+  # Contribution du prior spatial ####
+  Rw = as.vector( R_tilde %*% w_current )
+  log_prior = -0.5 * sum(Rw^2)
+
+  # Log-posterior 
+  log_posterior = log_likelihood + log_prior
+
+  return( log_posterior )
+}
+```
+
+## Gradient analytique du log-posterior
+
+Pour la partie Bernoulli-logistique,
+
+$$\nabla_w\log p(y\mid w)=y-p.$$
+
+Pour le prior spatial,
+
+$$\nabla_w\log p(w)
+=- {\tilde{R}}^\top {\tilde{R}}w.$$
+
+Ainsi,
+
+$$\boxed{
+\nabla_w\log\pi(w\mid y)
+=
+y-p- {\tilde{R}}^\top {\tilde{R}}w
+}.$$
+
+La fonction suivante calcule exactement ce gradient sans construire de
+matrice dense.
+
+```{r}
+gradient_log_posterior_binary <- function( w_current, y, X, beta, R_tilde) {
+
+  # Prédicteur linéaire 
+  eta_current = as.vector( X %*% beta + w_current )
+  
+  # Probabilités courantes 
+  proba_current = plogis( eta_current)
+
+  # Gradient de la log-vraisemblance 
+  gradient_likelihood = y - proba_current
+
+  # Calcul de R_tilde * w 
+  Rw = R_tilde %*% w_current
+
+  # Gradient du log-prior 
+  gradient_prior = -as.vector( crossprod( R_tilde, Rw ) )
+
+  # Gradient total du log-posterior 
+  gradient = gradient_likelihood + gradient_prior
+  
+  return(gradient)
+}
+```
+
+# Validation numérique du gradient
+
+Avant de construire le MAP ou l'algorithme MALA, Je vérifie que le
+gradient analytique précédent correspond bien à une approximation
+numérique par différences finies centrées.
+
+Je commence par prendre comme point de test le vecteur nul.
+
+```{r}
+w_test = rep( 0,  n)
+```
+
+J'évalue d'abord le log-posterior en ce point.
+
+```{r}
+logpost_test = log_posterior_binary( w_current = w_test, y = y, X = X,
+                                      beta = beta,  R_tilde = R_tilde )
+
+logpost_test
+```
+
+Puis je calcule le gradient analytique.
+
+```{r}
+gradient_test = gradient_log_posterior_binary(  w_current = w_test, y = y, X = X,
+                                                 beta = beta,  R_tilde = R_tilde )
+
+summary(gradient_test)
+range(gradient_test)
+max(abs(gradient_test))
+```
+
+Il est normal que le gradient ne soit pas proche de zéro au point $w=0$,
+car ce point n'est pas nécessairement le mode de la distribution
+postérieure.
+
+## Différences finies centrées
+
+Pour éviter un coût inutile lorsque $n$ est grand, je vérifie seulement
+quelques composantes réparties dans le vecteur.
+
+```{r}
+indices_test = unique( pmin( n, c( 1, 10, 100, 1000, 5000, n ) ))
+epsilon = 1e-6
+```
+
+```{r}
+verification_gradient = data.frame(
+  index = indices_test,
+  gradient_analytique = NA_real_,
+  gradient_numerique = NA_real_,
+  difference = NA_real_
+)
+```
+
+```{r}
+gradient_analytique = gradient_log_posterior_binary( w_current = w_test, y = y, X = X,
+                                                     beta = beta, R_tilde = R_tilde )
+```
+
+```{r}
+for (k in seq_along(indices_test)) {
+  j = indices_test[k]
+  
+  # Perturbation positive 
+  w_plus = w_test
+  w_plus[j] = w_plus[j] + epsilon
+
+  # Perturbation négative 
+  w_minus = w_test
+  w_minus[j] =  w_minus[j] - epsilon
+
+  # Log-posterior après perturbation positive 
+  logpost_plus = log_posterior_binary( w_current = w_plus, y = y, X = X,
+                                       beta = beta, R_tilde = R_tilde )
+
+
+  # Log-posterior après perturbation négative 
+  logpost_minus = log_posterior_binary( w_current = w_minus, y = y, X = X,
+                                         beta = beta, R_tilde = R_tilde )
+
+  # Approximation numérique de la dérivée 
+  gradient_numerique = (logpost_plus - logpost_minus) / (2 * epsilon)
+
+  # Enregistrement des résultats
+  verification_gradient$gradient_analytique[k] = gradient_analytique[j]
+  verification_gradient$gradient_numerique[k] = gradient_numerique
+  verification_gradient$difference[k] = abs(gradient_analytique[j] - gradient_numerique )
+}
+
+verification_gradient
+```
+
+# Calcul du MAP du champ latent
+
+Je cherche maintenant le mode de la distribution postérieure :
+
+$$\boxed{
+w_{\mathrm{MAP}}
+=
+\arg\max_w \log\pi(w\mid y)
+}.$$
+
+Le gradient du log-posterior est
+
+$$g(w)=y-p-Qw,$$
+
+avec
+
+$$Q= {\tilde{R}}^\top {\tilde{R}}.$$
+
+La Hessienne négative du log-posterior est
+
+$$-\nabla^2\log\pi(w\mid y)
+=
+Q+D(w),$$
+
+où
+
+$$D(w)=\operatorname{diag}\left(p_i(1-p_i)\right).$$
+
+Je peux donc utiliser une méthode de Newton. À chaque itération, le pas
+est obtenu en résolvant
+
+$$\left[Q+D(w^{(k)})\right]\delta^{(k)}=g(w^{(k)}),$$
+
+puis
+
+$$w^{(k+1)}=w^{(k)}+\delta^{(k)}.$$
+
+```{r}
+find_map_binary <- function(y, X, beta, R_tilde, w_initial = NULL,
+                            tolerance = 1e-6, max_iter = 100,
+                            verbose = TRUE) {
+  n_w = length(y)
+  w_current = if (is.null(w_initial)) rep(0, n_w) else as.vector(w_initial)
+  prior_precision = crossprod(R_tilde)
+  convergence = FALSE
+  difference = Inf
+
+  for (iteration in seq_len(max_iter)) {
+    eta_current = as.vector(X %*% beta + w_current)
+    proba_current = plogis(eta_current)
+    gradient_current = y - proba_current - as.vector(prior_precision %*% w_current)
+    D_current = proba_current * (1 - proba_current)
+    posterior_precision = prior_precision
+    Matrix::diag(posterior_precision) = Matrix::diag(posterior_precision) + D_current
+    newton_step = as.vector(Matrix::solve(posterior_precision, gradient_current))
+    w_new = w_current + newton_step
+    difference = max(abs(w_new - w_current))
+
+    if (verbose) {
+      cat("Iteration :", iteration, "| difference :", difference,
+          "| gradient max :", max(abs(gradient_current)), "\n")
+    }
+
+    w_current = w_new
+    if (difference < tolerance) {
+      convergence = TRUE
+      break
+    }
+  }
+
+  w_map = w_current
+  eta_map = as.vector(X %*% beta + w_map)
+  proba_map = plogis(eta_map)
+  D_map = proba_map * (1 - proba_map)
+  posterior_precision_map = prior_precision
+  Matrix::diag(posterior_precision_map) = Matrix::diag(posterior_precision_map) + D_map
+  gradient_map = gradient_log_posterior_binary(w_map, y, X, beta, R_tilde)
+
+  return(list(
+    w_map = w_map,
+    eta_map = eta_map,
+    proba_map = proba_map,
+    D_map = D_map,
+    prior_precision = prior_precision,
+    posterior_precision_map = posterior_precision_map,
+    max_gradient = max(abs(gradient_map)),
+    iterations = iteration,
+    difference = difference,
+    convergence = convergence
+  ))
+}
+```
+
+## Exécution du calcul du MAP
+
+J'applique maintenant la fonction aux données simulées précédemment. Le
+vecteur initial est laissé à `NULL`, ce qui correspond à une
+initialisation en $w=0$.
+
+```{r}
+MAP = find_map_binary(y, X, beta, R_tilde, verbose = TRUE)
+w_map = MAP$w_map
+
+c(convergence = MAP$convergence,
+  iterations = MAP$iterations,
+  difference = MAP$difference,
+  max_gradient = MAP$max_gradient)
+```
+
+Sur la configuration de validation en dimension 2, Newton a convergé en
+6 itérations et la norme maximale du gradient final était de l'ordre de
+$10^{-12}$. La corrélation entre le champ simulé et le MAP était
+d'environ $0.95$, ce qui confirme que le mode posterior retrouve
+correctement la structure spatiale du champ latent.
+
+## Comparaison entre le champ latent simulé et le MAP
+
+Dans cette étude de simulation, le vrai champ latent $w$ est connu. Je
+peux donc comparer directement $w_{\mathrm{MAP}}$ au champ qui a généré
+les observations.
+
+```{r}
+c(correlation = cor(w, w_map),
+  RMSE = sqrt(mean((w - w_map)^2)),
+  MAE = mean(abs(w - w_map)))
+```
+
+Pour cette configuration en dimension 2, le MAP restitue correctement la
+structure spatiale du champ latent simulé. La corrélation entre w et
+w_MAP est élevée, avec une valeur de 0.9501. La RMSE vaut 0.2025 et la
+MAE 0.1590. Ces résultats indiquent que, malgré le caractère binaire des
+observations et donc la perte d'information par rapport au cas gaussien,
+le mode de la distribution postérieure permet de reconstruire
+efficacement le champ latent. Le MAP constitue ainsi une initialisation
+pertinente pour les chaînes MCMC et fournit également un point de
+référence adapté à la construction du préconditionnement posterior.
+
+# Construction des préconditionnements pour MALA
+
+Dans le cas binaire, je ne conserve plus le préconditionnement identité.
+Deux préconditionnements seront comparés :
+
+- **Prior** : basé uniquement sur la précision du champ spatial ;
+- **Posterior** : basé sur la courbure de la postérieure évaluée au MAP.
+
+## Préconditionnement prior
+
+La précision du prior est
+
+$$\boxed{
+Q_{\mathrm{prior}}
+=
+{\tilde{R}}^\top {\tilde{R}}
+}.$$
+
+Elle est déjà disponible dans l'objet `MAP`.
+
+```{r}
+conditioning_prior = MAP$prior_precision
+```
+
+## Préconditionnement posterior au MAP
+
+Au MAP, la courbure de la vraisemblance est
+
+$$D_{\mathrm{MAP}}
+=
+\operatorname{diag}\left[
+ p_{i,\mathrm{MAP}}(1-p_{i,\mathrm{MAP}})
+\right].$$
+
+La précision locale postérieure utilisée comme préconditionneur est donc
+
+$$\boxed{
+Q_{\mathrm{posterior,MAP}}
+=
+{\tilde{R}}^\top {\tilde{R}}
++
+D_{\mathrm{MAP}}
+}.$$
+
+```{r}
+conditioning_posterior = MAP$posterior_precision_map
+```
+
+## Vérification des diagonales
+
+Le terme ajouté au préconditionnement posterior est toujours positif ou
+nul puisque
+
+$$p_i(1-p_i)\geq 0.$$
+
+Je vérifie donc les diagonales des deux matrices.
+
+```{r}
+summary( Matrix::diag(conditioning_prior) )
+```
+
+```{r}
+summary( Matrix::diag(conditioning_posterior))
+```
+
+```{r}
+summary(MAP$D_map)
+```
+
+La diagonale de courbure logistique au MAP, D_MAP varie ici entre 0.0517
+et sa valeur maximale théorique 0.25, avec une moyenne de 0.1586. Elle
+n’est donc pas constante sur l’espace : l’information apportée par la
+vraisemblance dépend de la probabilité locale pi_MAP. Les valeurs
+proches de 0.25 correspondent à des probabilités proches de 0.5, pour
+lesquelles la courbure de la vraisemblance Bernoulli-logistique est
+maximale, tandis que les valeurs plus faibles correspondent à des
+probabilités plus proches de 0 ou de 1. Ainsi, le préconditionnement
+posterior Q_post,MAP ajoute une correction positive et spatialement
+hétérogène à la précision du prior. Cette correction améliore notamment
+les directions de faible courbure du prior et peut donc faciliter
+l’exploration de la distribution postérieure par MALA.
+
+# Factorisations de Cholesky des préconditionnements
+
+## Cholesky du préconditionnement prior
+
+```{r}
+conditioning_prior_chol = Matrix::expand(
+  Matrix::Cholesky( conditioning_prior, LDL = FALSE, perm = TRUE, super = FALSE ))
+```
+
+## Cholesky du préconditionnement posterior au MAP
+
+```{r}
+conditioning_posterior_chol = Matrix::expand(
+  Matrix::Cholesky( conditioning_posterior, LDL = FALSE, perm = TRUE, super = FALSE )
+)
+```
+
+# MALA préconditionné avec momentum
+
+## Algorithme
+
+Le momentum suit une loi gaussienne associée au préconditionneur $C$ et
+est partiellement rafraîchi selon
+
+$$p_{\mathrm{ref}}=\rho p+\sqrt{1-\rho^2}\,\xi,
+\qquad \xi\sim\mathcal N(0,C).$$
+
+Un pas leapfrog est ensuite effectué, puis la proposition est corrigée
+par une étape de Metropolis--Hastings. Le pas est adapté pendant le
+burn-in vers un taux d'acceptation cible de $0.574$.
+
+Pour limiter la mémoire lors des expériences de taille $n=10000$, la
+moyenne et la variance postérieures sont calculées en ligne. Les ESS
+sont calculés sur 100 composantes réparties régulièrement dans le champ.
+Cette convention doit être gardée à l'esprit lors de l'interprétation
+des colonnes `ess_mean`, `ess_median`, `ess_min` et `ess_max`.
+
+```{r}
+ess_indices = unique(round(seq(1, n, length.out = 100)))
+
+fct_mala_precond_momentum_binary <- function(
+    R_tilde, X, beta, y, n_iter, burn_in, rho,
+    conditioning_mat, w_initial, ess_indices) {
+
+  s = 1
+  n = length(y)
+  target_accept = 0.574
+  P = conditioning_mat$P
+  L = conditioning_mat$L
+  if (is.null(P)) P = Matrix::Diagonal(nrow(L))
+
+  solveCond <- function(v) {
+    as.vector(Matrix::crossprod(P, Matrix::solve(Matrix::t(L),Matrix::solve(L, P %*% v))))
+  }
+
+  solveCholCond <- function() {
+    as.vector(Matrix::crossprod(P, L %*% rnorm(n)))
+  }
+
+  xb = as.vector(X %*% beta)
+
+  logpi <- function(w) {
+    proba = plogis(xb + w)
+    log_likelihood = sum(dbinom(y, 1, proba, log = TRUE))
+    log_prior = -0.5 * sum((R_tilde %*% w)^2)
+    log_likelihood + log_prior
+  }
+
+  grad <- function(w) {
+    proba = plogis(xb + w)
+    y - proba - as.vector(Matrix::crossprod(R_tilde, R_tilde %*% w))
+  }
+
+  kinetic <- function(p) 0.5 * as.numeric(Matrix::crossprod(p, solveCond(p)))
+  H <- function(w, p) -logpi(w) + kinetic(p)
+
+  w = as.vector(w_initial)
+  p = solveCholCond()
+  log_s = log(s)
+  n_post = n_iter - burn_in
+  mean_w = numeric(n)
+  M2_w = numeric(n)
+  trace_ess = matrix(NA_real_, nrow = n_post, ncol = length(ess_indices))
+  accept = integer(n_iter)
+  s_history = numeric(n_iter)
+  compteur_post = 0L
+
+  for (i in seq_len(n_iter)) {
+    eps = exp(log_s)
+    accepte = 0L
+    p_ref = rho * p + sqrt(1 - rho^2) * solveCholCond()
+    p_half = p_ref + (eps / 2) * grad(w)
+    w_prop = w + eps * solveCond(p_half)
+    p_prop = p_half + (eps / 2) * grad(w_prop)
+    log_alpha = -H(w_prop, p_prop) + H(w, p_ref)
+    log_acc = if (is.finite(log_alpha)) min(0, log_alpha) else -Inf
+
+    if (log(runif(1)) < log_acc) {
+      w = w_prop
+      p = p_prop
+      accepte = 1L
+    } else {
+      p = -p_ref
+    }
+
+    if (i <= burn_in) {
+      gamma = 1 / (i + 10)^0.6
+      log_s = log_s + gamma * (accepte - target_accept)
+      log_s = max(log(1e-6), min(log_s, log(10)))
+    }
+
+    accept[i] = accepte
+    s_history[i] = exp(log_s)
+
+    if (i > burn_in) {
+      compteur_post = compteur_post + 1L
+      delta = w - mean_w
+      mean_w = mean_w + delta / compteur_post
+      M2_w = M2_w + delta * (w - mean_w)
+      trace_ess[compteur_post, ] = w[ess_indices]
+    }
+  }
+
+  sd_w = sqrt(M2_w / (compteur_post - 1))
+  ess = as.numeric(coda::effectiveSize(coda::as.mcmc(trace_ess)))
+  ind_post = (burn_in + 1):n_iter
+
+  return(list(
+    mean_w = mean_w,
+    sd_w = sd_w,
+    ess_mean = mean(ess, na.rm = TRUE),
+    ess_median = median(ess, na.rm = TRUE),
+    ess_min = min(ess, na.rm = TRUE),
+    ess_max = max(ess, na.rm = TRUE),
+    accept_rate = mean(accept),
+    accept_rate_post = mean(accept[ind_post]),
+    final_step = exp(log_s),
+    s_history = s_history
+  ))
+}
+```
+
+# Validation sur une configuration
+
+Avant l'expérience factorielle, les deux préconditionnements sont
+comparés sur le même jeu de données et avec la même valeur de $\rho$.
+
+```{r}
+set.seed(1001)
+MCMC_prior = fct_mala_precond_momentum_binary(
+  R_tilde, X, beta, y, n_iter, burn_in, rho,
+  conditioning_prior_chol, w_map, ess_indices
+)
+
+set.seed(1002)
+MCMC_posterior = fct_mala_precond_momentum_binary(
+  R_tilde, X, beta, y, n_iter, burn_in, rho,
+  conditioning_posterior_chol, w_map, ess_indices
+)
+
+diagnostics_MCMC = data.frame(
+  conditioning = c("prior", "posterior"),
+  accept_rate_post = c(MCMC_prior$accept_rate_post, MCMC_posterior$accept_rate_post),
+  final_step = c(MCMC_prior$final_step, MCMC_posterior$final_step),
+  ess_mean = c(MCMC_prior$ess_mean, MCMC_posterior$ess_mean),
+  ess_median = c(MCMC_prior$ess_median, MCMC_posterior$ess_median),
+  ess_min = c(MCMC_prior$ess_min, MCMC_posterior$ess_min),
+  ess_max = c(MCMC_prior$ess_max, MCMC_posterior$ess_max)
+)
+diagnostics_MCMC
+```
+
+Dans la validation 2D effectuée avec $\rho=0.5$, le conditionnement
+posterior a permis un pas environ quatre fois plus grand et une ESS
+médiane environ trois fois supérieure au conditionnement prior. Les deux
+méthodes ont néanmoins donné des reconstructions très proches du même
+champ latent. Ce résultat indique que le préconditionnement agit
+principalement sur l'efficacité d'exploration de la cible et non sur la
+cible elle-même.
+
+```{r}
+comparaison_estimation = data.frame(
+  methode = c("MAP", "MCMC prior", "MCMC posterior"),
+  correlation = c(cor(w, w_map), cor(w, MCMC_prior$mean_w),
+                  cor(w, MCMC_posterior$mean_w)),
+  RMSE = c(sqrt(mean((w - w_map)^2)),
+           sqrt(mean((w - MCMC_prior$mean_w)^2)),
+           sqrt(mean((w - MCMC_posterior$mean_w)^2))),
+  MAE = c(mean(abs(w - w_map)), mean(abs(w - MCMC_prior$mean_w)),
+          mean(abs(w - MCMC_posterior$mean_w)))
+)
+comparaison_estimation
+```
+
+Les trois méthodes reconstruisent correctement le champ latent, avec des
+corrélations proches de 0.95. Le MCMC utilisant le préconditionnement
+posterior présente ici les meilleurs critères de reconstruction : sa
+corrélation avec le champ simulé est légèrement supérieure (0.9508),
+tandis que sa RMSE (0.1981) et sa MAE (0.1552) sont les plus faibles. Le
+MCMC prior reste très proche du MAP, mais donne des erreurs légèrement
+plus élevées. Ces écarts demeurent modestes : ils suggèrent surtout que
+les trois approches visent une estimation cohérente du champ latent,
+tandis que le préconditionnement posterior améliore légèrement la
+qualité de l’estimation sur cette réalisation.
+
+```{r}
+plot(MCMC_prior$s_history, type = "l", lwd = 2, col = "blue",
+     xlab = "Itération", ylab = "Pas", main = "Évolution du pas MALA")
+lines(MCMC_posterior$s_history, col = "green", lwd = 2)
+abline(v = burn_in, col = "red", lty = 2)
+legend("topright", c("Prior", "Posterior au MAP", "Fin du burn-in"),
+       col = c("blue", "green", "red"), lty = c(1, 1, 2), lwd = 2, bty = "n")
+```
+
+# Expérience factorielle parallèle
+
+## Grille de paramètres
+
+L'expérience systématique étudie l'effet de la régularité $\nu$, de la
+portée spatiale, de la persistance du momentum $\rho$ et du
+préconditionnement. Cinq graines sont utilisées pour mesurer la
+variabilité entre répétitions.
+
+```{r}
+experiment_parameters = as.matrix(expand.grid(
+  sigma2 = c(0.5, 1, 2),
+  nu = c(0.5, 1.5),
+  range = c(0.05, 0.2, 0.5),
+  beta0 = c(-1, 0, 1),
+  rho = c(0, 0.5, 0.9),
+  conditioning = c(1, 2),
+  seed = 1:5
+))
+
+nrow(experiment_parameters)
+```
+
+La grille contient 1620 chaînes MCMC. Pour une même combinaison `seed`,
+`nu` , `range`, `sigma2` et `beta0` les données simulées sont identiques
+entre les différentes valeurs de `rho` et de `conditioning`, car la
+graine est réinitialisée avant la simulation.
+
+## Exécution parallèle et sauvegarde des figures
+
+Chaque chaîne possède son propre dossier. Trois figures sont
+sauvegardées : les observations, le champ latent simulé et la moyenne
+postérieure estimée. Cette organisation reprend celle utilisée dans le
+cas gaussien et facilite la comparaison visuelle des configurations.
+
+Le calcul de `rcond` n'est pas répété dans l'expérience factorielle :
+avec des matrices de taille $10000\times10000$, cette opération peut
+entraîner une conversion creuse-vers-dense coûteuse en mémoire. Le
+diagnostic de conditionnement a déjà été étudié lors de la phase de
+validation.
+
+```{r}
+cl = parallel::makeCluster(max(1, floor(parallel::detectCores() * 0.5)))
+
+parallel::clusterExport(
+  cl,
+  varlist = c("experiment_parameters", "burn_in", "n_iter", "dimension",
+              "n", "nb_nn", "ess_indices", "createLocs",
+              "gradient_log_posterior_binary", "find_map_binary",
+              "fct_mala_precond_momentum_binary"),
+  envir = .GlobalEnv
+)
+
+experiment_results = parallel::parLapply(
+  cl = cl,
+  X = split(experiment_parameters, row(experiment_parameters)),
+  fun = function(params) {
+    names(params) = colnames(experiment_parameters)
+
+    sigma2 = as.numeric(params["sigma2"])
+    nu = as.numeric(params["nu"])
+    range = as.numeric(params["range"]) 
+    beta0 = as.numeric(params["beta0"])
+    rho = as.numeric(params["rho"])
+    conditioning = as.integer(params["conditioning"])
+    seed = as.integer(params["seed"])
+
+    beta = c(beta0, 0.01)
+
+    set.seed(seed)
+
+    locs = createLocs(dimension, n)
+    X = cbind(1, rnorm(n))
+
+    NNarray = GpGp::find_ordered_nn(locs, nb_nn)
+
+    Linv = GpGp::vecchia_Linv(
+      c(sigma2, range / sqrt(nu), nu, 0.0001),
+      "matern_isotropic", locs, NNarray
+    )
+
+    R_tilde = Matrix::sparseMatrix(
+      i = row(NNarray)[!is.na(NNarray)],
+      j = NNarray[!is.na(NNarray)],
+      x = Linv[!is.na(NNarray)],
+      triangular = TRUE
+    )
+
+    w = as.vector(Matrix::solve(R_tilde, rnorm(n)))
+    eta = as.vector(X %*% beta + w)
+    proba = plogis(eta)
+    y = rbinom(n, size = 1, prob = proba)
+
+    MAP = find_map_binary(
+      y, X, beta, R_tilde,
+      tolerance = 1e-6,
+      max_iter = 100,
+      verbose = FALSE
+    )
+
+    if (conditioning == 1) conditioning_mat = MAP$prior_precision
+    if (conditioning == 2) conditioning_mat = MAP$posterior_precision_map
+
+    conditioning_mat = Matrix::expand(
+      Matrix::Cholesky(
+        conditioning_mat,
+        LDL = FALSE,
+        perm = TRUE,
+        super = FALSE
+      )
+    )
+
+    mcmc_seed =
+      seed * 10000000 +
+      match(sigma2, c(0.5, 1, 2)) * 1000000 +
+      match(nu, c(0.5, 1.5)) * 100000 +
+      match(range, c(0.05, 0.2, 0.5)) * 10000 +
+      match(beta0, c(-1, 0, 1)) * 1000 +
+      match(rho, c(0, 0.5, 0.9)) * 10 +
+      conditioning
+
+    set.seed(mcmc_seed)
+
+    temps = system.time({
+      MCMC = fct_mala_precond_momentum_binary(
+        R_tilde, X, beta, y, n_iter, burn_in, rho,
+        conditioning_mat, MAP$w_map, ess_indices
+      )
+    })
+
+    experiment_dir = file.path(
+      paste0("Binary_experiment_results_dim", dimension),
+      paste0(
+        "seed_", seed,
+        "_sigma2_", sigma2,
+        "_nu_", nu,
+        "_range_", range,
+        "_beta0_", beta0,
+        "_rho_", rho,
+        "_conditioning_", conditioning
+      )
+    )
+
+    dir.create(experiment_dir, recursive = TRUE, showWarnings = FALSE)
+
+    if (dimension == 1) {
+      ord = order(locs[, 1])
+      x = locs[ord, 1]
+
+      png(file.path(experiment_dir, "observed.png"),
+          width = 1200, height = 900, res = 150)
+      plot(x, y[ord], pch = 16, cex = 0.5,
+           col = ifelse(y[ord] == 1, "orange", "black"),
+           xlab = "Position spatiale", ylab = "Observation",
+           main = "Données binaires observées")
+      dev.off()
+
+      png(file.path(experiment_dir, "latent.png"),
+          width = 1200, height = 900, res = 150)
+      plot(x, w[ord], type = "l", lwd = 2,
+           xlab = "Position spatiale", ylab = "Champ latent",
+           main = "Champ latent simulé")
+      dev.off()
+
+      png(file.path(experiment_dir, "estimated_mean.png"),
+          width = 1200, height = 900, res = 150)
+      plot(x, MCMC$mean_w[ord], type = "l", lwd = 2,
+           xlab = "Position spatiale", ylab = "Moyenne postérieure",
+           main = "Moyenne postérieure estimée")
+      dev.off()
+    }
+
+    if (dimension == 2) {
+      png(file.path(experiment_dir, "observed.png"),
+          width = 1200, height = 1000, res = 150)
+      par(mar = c(1, 1, 2, 1))
+      plot(locs[, 1], locs[, 2], pch = 15, cex = 1,
+           col = ifelse(y == 1, "orange", "black"),
+           xlab = "", ylab = "", xaxt = "n", yaxt = "n",
+           main = paste0(
+             "Observations binaires - proportion de 1 = ",
+             round(mean(y), 3)
+           ))
+      legend("topright", c("y = 1", "y = 0"),
+             col = c("orange", "black"), pch = 15, bty = "n")
+      dev.off()
+
+      png(file.path(experiment_dir, "latent.png"),
+          width = 1200, height = 1000, res = 150)
+      par(mar = c(0.5, 0.5, 1.5, 0.5))
+      GeoNonStat::plotPointillistPainting(
+        locs, w, cex = 20,
+        main = "Champ latent simulé"
+      )
+      dev.off()
+
+      png(file.path(experiment_dir, "estimated_mean.png"),
+          width = 1200, height = 1000, res = 150)
+      par(mar = c(0.5, 0.5, 1.5, 0.5))
+      GeoNonStat::plotPointillistPainting(
+        locs, MCMC$mean_w, cex = 20,
+        main = "Moyenne postérieure estimée"
+      )
+      dev.off()
+    }
+
+    data.frame(
+      dimension = dimension,
+      seed = seed,
+      sigma2 = sigma2,
+      nu = nu,
+      range = range,
+      beta0 = beta0,
+      beta1 = 0.01,
+      rho = rho,
+      conditioning = conditioning,
+      proportion_y = mean(y),
+      mean_proba = mean(proba),
+      map_convergence = MAP$convergence,
+      map_iterations = MAP$iterations,
+      map_max_gradient = MAP$max_gradient,
+      mean_D_map = mean(MAP$D_map),
+      accept_rate = MCMC$accept_rate,
+      accept_rate_post = MCMC$accept_rate_post,
+      final_step = MCMC$final_step,
+      ess_mean = MCMC$ess_mean,
+      ess_median = MCMC$ess_median,
+      ess_min = MCMC$ess_min,
+      ess_max = MCMC$ess_max,
+      correlation = cor(w, MCMC$mean_w),
+      RMSE = sqrt(mean((w - MCMC$mean_w)^2)),
+      MAE = mean(abs(w - MCMC$mean_w)),
+      elapsed_time = as.numeric(temps["elapsed"])
+    )
+  }
+)
+
+parallel::stopCluster(cl)
+```
+
+## Mise en forme et sauvegarde
+
+Les résultats sont regroupés dans un tableau unique puis sauvegardés en
+formats RDS et CSV. Les noms de fichiers indiquent la dimension afin de
+pouvoir exécuter séparément les expériences 1D et 2D.
+
+```{r}
+experiment_results = do.call(rbind, experiment_results)
+rownames(experiment_results) = NULL
+
+nom_rds = paste0("experiment_binary_results_dim", dimension, ".rds")
+nom_csv = paste0("experiment_binary_results_dim", dimension, ".csv")
+
+saveRDS(experiment_results, nom_rds)
+write.csv(experiment_results, nom_csv, row.names = FALSE)
+
+dim(experiment_results)
+head(experiment_results)
+```
+
+Je vérifie enfin que toutes les chaînes prévues ont été calculées et que
+les MAP ont convergé.
+
+```{r}
+table(experiment_results$conditioning)
+table(experiment_results$rho)
+table(experiment_results$map_convergence)
+```
+
+# Analyse des résultats factoriels
+
+## Résumé par conditionnement
+
+Ce premier tableau compare globalement les deux préconditionnements sur
+l'ensemble des paramètres spatiaux, des valeurs de $\rho$ et des cinq
+répétitions.
+
+```{r}
+aggregate(
+  cbind(ess_mean, ess_median, ess_min, final_step,
+        accept_rate_post, RMSE, elapsed_time) ~ conditioning,
+  data = experiment_results,
+  FUN = mean
+)
+```
+
+## Modèle linéaire pour l'ESS médian
+
+L'ESS médian est retenu comme critère principal car il est moins
+sensible aux valeurs extrêmes que l'ESS moyen. Les interactions
+permettent de déterminer si l'effet de $\nu$, de la portée ou de $\rho$
+dépend du préconditionnement.
+
+```{r}
+modele_ess_median <- lm(
+  ess_median ~ factor(seed) +
+    factor(sigma2) * factor(conditioning) +
+    factor(nu) * factor(conditioning) +
+    factor(range) * factor(conditioning) +
+    factor(beta0) * factor(conditioning) +
+    factor(rho) * factor(conditioning),
+  data = experiment_results
+)
+
+summary(modele_ess_median)
+```
+
+Le modèle linéaire explique une part importante de la variabilité de
+l’ESS médian, avec un R² de 0.904 et un R² ajusté de 0.898. Le test
+global du modèle est hautement significatif (p\< 2.2×10−16), ce qui
+montre que les paramètres expérimentaux et les interactions considérées
+contribuent fortement aux différences d’efficacité observées entre les
+chaînes. L’écart-type résiduel est de 21.08, ce qui reste modéré
+relativement à l’amplitude des variations d’ESS observées dans
+l’expérience.
+
+## Classement des configurations
+
+Les résultats sont moyennés sur les cinq graines afin de comparer les
+configurations algorithmiques et spatiales indépendamment d'une
+réalisation particulière.
+
+```{r}
+resultats_moyens = aggregate(
+  cbind(ess_mean, ess_median, ess_min, final_step,
+        accept_rate_post, RMSE) ~ sigma2 + nu + range + beta0 + rho + conditioning,
+  data = experiment_results,
+  FUN = mean
+)
+
+resultats_moyens = resultats_moyens[order(-resultats_moyens$ess_median), ]
+head(resultats_moyens, 20)
+```
+
+Le classement des configurations montre que l’efficacité de MALA dépend
+conjointement des paramètres spatiaux, de la persistance du momentum et
+du préconditionnement. La meilleure ESS médiane moyenne est obtenue pour
+ν=2.5, une portée de 0.05, ρ=0.9 et le préconditionnement prior, avec
+une ESS médiane d’environ 268. Ce résultat montre que le
+préconditionnement posterior n’est pas uniformément optimal pour toutes
+les configurations. Toutefois, parmi les configurations les mieux
+classées, le préconditionnement posterior apparaît très fréquemment, en
+particulier pour ρ=0.5, avec des ESS médianes dépassant souvent 200.
+L’efficacité de chaque préconditionnement dépend donc de son interaction
+avec la structure spatiale du champ et avec le degré de persistance du
+momentum.
+
+## Effet de $\rho$ et du conditionnement
+
+```{r}
+experiment_results$conditioning_label = factor(
+  experiment_results$conditioning,
+  levels = c(1, 2),
+  labels = c("Prior", "Posterior")
+)
+
+ggplot(experiment_results,
+       aes(x = factor(rho), y = ess_median, fill = conditioning_label)) +
+  geom_boxplot(alpha = 0.8) +
+  theme_bw() +
+  labs(x = expression(rho), y = "ESS médian", fill = "Conditionnement") +
+  theme(text = element_text(size = 14))
+```
+
+# Conclusion
+
+La procédure finale repose sur une cible postérieure binaire validée,
+une initialisation au MAP et deux préconditionnements fixes. Le
+préconditionnement prior exploite uniquement la structure du champ
+spatial, tandis que le préconditionnement posterior ajoute la courbure
+locale de la vraisemblance au MAP.
+
+Les essais de validation en dimensions 1 et 2 ont montré que les deux
+méthodes produisent des estimations du même champ latent, mais que le
+préconditionnement posterior peut autoriser des pas sensiblement plus
+grands et augmenter fortement les ESS. L'expérience factorielle permet
+désormais de déterminer si ce gain persiste lorsque la régularité, la
+portée, la persistance du momentum et la réalisation simulée varient.
+
+```{r}
+experiment_results = read.csv("experiment_binary_results_dim2.csv" , header = TRUE)
+
+library(dplyr)
+
+resume_strategies =
+  experiment_results %>%
+  mutate(
+    conditioning_label = factor(
+      conditioning,
+      levels = c(0, 1, 2),
+      labels = c("Identity", "Prior", "Posterior")
+    )
+  ) %>%
+  group_by(conditioning_label, rho) %>%
+  summarise(
+    n = n(),
+    ess_mean = mean(ess_median),
+    ess_median_global = median(ess_median),
+    ess_sd = sd(ess_median),
+    ess_q10 = quantile(ess_median, 0.10),
+    ess_q25 = quantile(ess_median, 0.25),
+    ess_q75 = quantile(ess_median, 0.75),
+    ess_min = min(ess_median),
+    ess_max = max(ess_median),
+    .groups = "drop"
+  )
+
+resume_strategies
+```
